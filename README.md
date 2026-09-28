@@ -51,6 +51,46 @@ source .venv/bin/activate
 python -m pip install -U -e ".[dev]"
 ```
 
+## Web UI
+
+The `web-ui` branch includes a local FastAPI server and browser interface.
+
+Install/update dependencies:
+
+```bat
+python -m pip install -U -e ".[dev]"
+```
+
+Start the web app:
+
+```bat
+muse-web --host 127.0.0.1 --port 8787
+```
+
+or on Windows:
+
+```bat
+run_web.bat
+```
+
+Open:
+
+```text
+http://127.0.0.1:8787
+```
+
+The UI supports Muse OTP login, text-to-video, optional reference images, background generation jobs, live status polling, in-browser video playback, and MP4 downloads.
+
+REST API documentation is available at:
+
+```text
+http://127.0.0.1:8787/docs
+```
+
+Web job metadata and downloaded media are stored under `.muse-web/`, which is excluded from Git. Closing the browser tab does not stop a running job, but stopping the `muse-web` process does.
+
+> The web server binds to `127.0.0.1` by default. Do not expose it publicly unless you add your own access control and deployment security.
+
 ## Quick Start
 
 ### 1. Login

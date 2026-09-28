@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="vi">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MuseAI Studio</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <div class="noise"></div>
+  <main class="shell">
+    <header class="topbar">
+      <div>
+        <div class="eyebrow">MUSEAI-API</div>
+        <h1>MuseAI Studio</h1>
+        <p>Tạo và theo dõi video Muse trực tiếp từ trình duyệt.</p>
+      </div>
+      <div id="authPill" class="pill neutral"><span class="dot"></span><span>Đang kiểm tra</span></div>
+    </header>
+
+    <section class="grid">
+      <aside class="panel auth-panel">
+        <div class="panel-head">
+          <div><span class="step">01</span><h2>Kết nối Muse</h2></div>
+        </div>
+        <p class="muted">Đăng nhập OTP một lần. Session được lưu cục bộ trong <code>.muse-state</code>.</p>
+
+        <label>Email Muse</label>
+        <div class="row">
+          <input id="email" type="email" placeholder="you@example.com" autocomplete="email">
+          <button id="sendOtp" class="button secondary">Gửi OTP</button>
+        </div>
+
+        <div id="otpArea" class="otp-area hidden">
+          <label>Mã OTP</label>
+          <div class="row">
+            <input id="otp" inputmode="numeric" placeholder="123456" maxlength="12">
+            <button id="confirmOtp" class="button secondary">Xác nhận</button>
+          </div>
+        </div>
+        <div id="authMessage" class="message"></div>
+
+        <div class="divider"></div>
+        <div class="api-note">
+          <strong>REST API</strong>
+          <span>Swagger: <a href="/docs" target="_blank">/docs</a></span>
+          <span>OpenAPI: <a href="/openapi.json" target="_blank">/openapi.json</a></span>
+        </div>
+      </aside>
+
+      <section class="panel create-panel">
+        <div class="panel-head">
+          <div><span class="step">02</span><h2>Tạo video</h2></div>
+          <button id="refreshModel" class="ghost">Kiểm tra model</button>
+        </div>
+
+        <label for="prompt">Prompt</label>
+        <textarea id="prompt" rows="9" placeholder="Mô tả video bạn muốn tạo..."></textarea>
+
+        <div class="prompt-actions">
+          <button class="chip" data-template="product">Quảng cáo sản phẩm</button>
+          <button class="chip" data-template="cinematic">Cinematic</button>
+          <button class="chip" data-template="social">Video dọc 9:16</button>
+          <span id="charCount" class="muted small">0 ký tự</span>
+        </div>
+
+        <label>Ảnh tham chiếu <span class="muted">(không bắt buộc)</span></label>
+        <label id="dropzone" class="dropzone">
+          <input id="images" type="file" accept="image/*" multiple hidden>
+          <div class="drop-icon">＋</div>
+          <strong>Thả ảnh vào đây hoặc bấm để chọn</strong>
+          <span>PNG · JPG · WEBP · có thể chọn nhiều ảnh</span>
+        </label>
+        <div id="imageList" class="image-list"></div>
+
+        <div class="controls">
+          <div>
+            <label>Số video tối thiểu</label>
+            <input id="minVideos" type="number" min="1" max="10" value="1">
+          </div>
+          <div>
+            <label>Timeout (giây)</label>
+            <input id="timeout" type="number" min="30" max="3600" value="600">
+          </div>
+        </div>
+
+        <button id="generate" class="button primary big">
+          <span>Tạo video</span><span class="arrow">→</span>
+        </button>
+        <div id="generateMessage" class="message"></div>
+      </section>
+    </section>
+
+    <section class="panel jobs-panel">
+      <div class="panel-head jobs-head">
+        <div><span class="step">03</span><h2>Generation jobs</h2></div>
+        <button id="refreshJobs" class="ghost">Làm mới</button>
+      </div>
+      <div id="activeJob" class="active-job hidden"></div>
+      <div id="jobs" class="jobs"></div>
+    </section>
+  </main>
+
+  <template id="jobTemplate">
+    <article class="job-card">
+      <div class="job-top">
+        <div>
+          <div class="job-id"></div>
+          <div class="job-time muted small"></div>
+        </div>
+        <span class="status"></span>
+      </div>
+      <p class="job-prompt"></p>
+      <div class="job-message muted"></div>
+      <div class="job-meta"></div>
+      <div class="videos"></div>
+      <div class="job-error"></div>
+    </article>
+  </template>
+
+  <script src="/app.js"></script>
+</body>
+</html>
