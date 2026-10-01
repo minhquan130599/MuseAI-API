@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import asyncio
 
+import httpx
 import pytest
 
 from muse_ai.client import GenerationResult, ImageGenerationResult, TextResult
 from muse_ai.media import ImageRef, VideoRef
 from muse_ai.mcp_server import (
     MuseMCPBridge,
+    OpenAIFileParam,
     VideoJob,
     build_server,
     serialize_generation_result,
@@ -138,7 +140,7 @@ async def test_mcp_server_registers_expected_tools(tmp_path):
         output_dir=tmp_path / "output",
     )
     tools = await server.list_tools()
-    names = {tool.name for tool in tools}
+    by_name = {tool.name: tool for tool in tools}
     assert {
         "muse_auth_status",
         "muse_ping",
@@ -150,10 +152,87 @@ async def test_mcp_server_registers_expected_tools(tmp_path):
         "muse_job_status",
         "muse_list_jobs",
         "muse_cancel_job",
-    } <= names
+    } <= set(by_name)
+
+    for tool_name in ("muse_generate_image", "muse_generate_video"):
+        tool = by_name[tool_name]
+        assert tool.meta == {"openai/fileParams": ["images"]}
+        file_schema = tool.inputSchema["$defs"]["OpenAIFileParam"]
+        assert set(file_schema["properties"]) == {
+            "download_url",
+            "file_id",
+            "mime_type",
+            "file_name",
+        }
+        assert file_schema["required"] == ["download_url", "file_id"]
+        assert file_schema["additionalProperties"] is False
 
     bridge = server._muse_bridge
     await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_file_param_downloads_to_temp_image(
+    tmp_path,
+    monkeypatch,
+):
+    bridge = MuseMCPBridge(output_dir=tmp_path / "output")
+    bridge.upload_dir = tmp_path / "uploads"
+    bridge.upload_dir.mkdir(parents=True, exist_ok=True)
+
+    real_async_client = httpx.AsyncClient
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert str(request.url) == "https://files.example.test/ref.png"
+        return httpx.Response(
+            200,
+            headers={"content-type": "image/png"},
+            content=b"fake-image-bytes",
+        )
+
+    def client_factory(*args, **kwargs):
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_async_client(*args, **kwargs)
+
+    monkeypatch.setattr(
+        "muse_ai.mcp_server.httpx.AsyncClient",
+        client_factory,
+    )
+
+    files = [
+        OpenAIFileParam(
+            download_url="https://files.example.test/ref.png",
+            file_id="file_123",
+            mime_type="image/png",
+            file_name="../../reference.png",
+        )
+    ]
+    paths, request_dir = await bridge._download_openai_files(files)
+
+    assert request_dir is not None
+    assert len(paths) == 1
+    assert paths[0].parent == request_dir
+    assert paths[0].name == "01-reference.png"
+    assert paths[0].read_bytes() == b"fake-image-bytes"
+
+
+@pytest.mark.asyncio
+async def test_chatgpt_file_param_rejects_non_https(tmp_path):
+    bridge = MuseMCPBridge(output_dir=tmp_path / "output")
+    bridge.upload_dir = tmp_path / "uploads"
+    bridge.upload_dir.mkdir(parents=True, exist_ok=True)
+
+    with pytest.raises(ValueError, match="HTTPS URL"):
+        await bridge._download_openai_files(
+            [
+                OpenAIFileParam(
+                    download_url="http://127.0.0.1/private.png",
+                    file_id="file_bad",
+                    mime_type="image/png",
+                    file_name="private.png",
+                )
+            ]
+        )
 
 
 def test_public_media_registration_rewrites_video_url(tmp_path):
