@@ -4,6 +4,7 @@ import argparse
 import asyncio
 import mimetypes
 import os
+import re
 import shutil
 import uuid
 from contextlib import asynccontextmanager
@@ -34,6 +35,28 @@ DEFAULT_UPLOAD_DIR = Path(
 MAX_IMPORTED_FILE_BYTES = int(
     os.environ.get("MUSE_MCP_MAX_FILE_BYTES", str(32 * 1024 * 1024))
 )
+_INTERNAL_MEDIA_URL_RE = re.compile(
+    r"https://[^\s\"'<>]*\.metaaivm\.com/media/[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+_INTERNAL_MEDIA_REDACTION = (
+    "[Muse internal media URL omitted; use generation public_url/download_url]"
+)
+
+
+def scrub_internal_media_urls(value: Any) -> Any:
+    if isinstance(value, str):
+        return _INTERNAL_MEDIA_URL_RE.sub(_INTERNAL_MEDIA_REDACTION, value)
+    if isinstance(value, list):
+        return [scrub_internal_media_urls(item) for item in value]
+    if isinstance(value, tuple):
+        return tuple(scrub_internal_media_urls(item) for item in value)
+    if isinstance(value, dict):
+        return {
+            key: scrub_internal_media_urls(item)
+            for key, item in value.items()
+        }
+    return value
 
 
 class OpenAIFileParam(BaseModel):
@@ -59,11 +82,13 @@ def serialize_text_result(
     payload: dict[str, Any] = {
         "ok": True,
         "session_id": result.session_id,
-        "text": result.text,
+        "text": scrub_internal_media_urls(result.text),
     }
     if include_raw:
-        payload["stream_events"] = result.stream_events
-        payload["history"] = result.history
+        payload["stream_events"] = scrub_internal_media_urls(
+            result.stream_events
+        )
+        payload["history"] = scrub_internal_media_urls(result.history)
     return payload
 
 
@@ -274,13 +299,14 @@ class MuseMCPBridge:
         async with self._text_call_lock:
             client = await self._get_text_client()
             try:
+                history = await client.history(
+                    session_id=session_id,
+                    limit=limit,
+                )
                 return {
                     "ok": True,
                     "session_id": session_id,
-                    "history": await client.history(
-                        session_id=session_id,
-                        limit=limit,
-                    ),
+                    "history": scrub_internal_media_urls(history),
                 }
             except Exception:
                 await self.reset_text_client()
@@ -485,6 +511,7 @@ class MuseMCPBridge:
             files=files,
         )
         client = await self._new_client()
+        effective_download = download or bool(self.public_base_url)
         try:
             result = await client.generate_video(
                 prompt=prompt,
@@ -494,7 +521,7 @@ class MuseMCPBridge:
                 else self.output_dir,
                 timeout=timeout_seconds,
                 min_videos=min_videos,
-                download=download,
+                download=effective_download,
             )
             return self._expose_downloaded_files(
                 serialize_generation_result(result),
@@ -520,6 +547,7 @@ class MuseMCPBridge:
             image_paths=image_paths,
             files=files,
         )
+        download = download or bool(self.public_base_url)
         job_id = uuid.uuid4().hex[:12]
         job = VideoJob(id=job_id, prompt=prompt)
 
@@ -615,6 +643,7 @@ class MuseMCPBridge:
             files=files,
         )
         client = await self._new_client()
+        effective_download = download or bool(self.public_base_url)
         try:
             result = await client.generate_image(
                 prompt=prompt,
@@ -624,7 +653,7 @@ class MuseMCPBridge:
                 else self.output_dir,
                 timeout=timeout_seconds,
                 min_images=min_images,
-                download=download,
+                download=effective_download,
             )
             return self._expose_downloaded_files(
                 serialize_image_generation_result(result),
@@ -650,6 +679,7 @@ class MuseMCPBridge:
             image_paths=image_paths,
             files=files,
         )
+        download = download or bool(self.public_base_url)
         job_id = uuid.uuid4().hex[:12]
         job = VideoJob(id=job_id, prompt=prompt, kind="image")
 
@@ -843,9 +873,13 @@ def build_server(
             "Use Muse through the user's authenticated local session. "
             "muse_send_text is only for normal text conversation; preserve its "
             "returned session_id for multi-turn text chats. For any request to "
-            "create an image, call muse_generate_image. For any request to create "
-            "a video, call muse_generate_video. Never present Muse/Hatch internal "
-            "metaaivm.com media URLs to the user. Generation results expose "
+            "create an image, call muse_generate_image. For a video request that "
+            "includes user-uploaded/reference images, call "
+            "muse_generate_video_from_images and pass every reference file in its "
+            "required images field. Use muse_generate_video only for text-only "
+            "video generation or local-path integrations. Never present "
+            "Muse/Hatch internal metaaivm.com media URLs to the user. Generation "
+            "results expose "
             "public_url/download_url fields backed by this MCP server; use those "
             "links only. For image or video generation, use wait=true for a "
             "blocking result or wait=false plus muse_job_status for asynchronous "
@@ -994,9 +1028,10 @@ def build_server(
 
     @server.tool(
         description=(
-            "Generate a Muse video from a text prompt. ChatGPT-uploaded reference "
-            "images are accepted through the images parameter; local agents may "
-            "use image_paths. Use this tool for all video-generation requests. "
+            "Generate a Muse video from a text prompt. Use this primarily for "
+            "text-only video generation or local agents using image_paths. If the "
+            "user attached/reference-uploaded images in ChatGPT, prefer "
+            "muse_generate_video_from_images so every file is required and forwarded. "
             "With wait=true it waits for the result and returns "
             "public_url/download_url links when public-base-url is configured. "
             "Only surface those public links to the user; never use Muse/Hatch "
@@ -1040,6 +1075,59 @@ def build_server(
             timeout_seconds=timeout_seconds,
             min_videos=min_videos,
             download=download,
+            output_dir=output_dir,
+        )
+
+    @server.tool(
+        description=(
+            "Generate a Muse video using user-uploaded/reference images from "
+            "ChatGPT. Use this tool whenever the user's request refers to attached "
+            "or uploaded images. The images field is required and ChatGPT forwards "
+            "the files through openai/fileParams. The server downloads every "
+            "reference image locally, passes all of them to Muse, always downloads "
+            "the generated video when a public-base-url is configured, and returns "
+            "public_url/download_url links. Never substitute a text-only generation "
+            "when reference images were requested."
+        ),
+        meta={"openai/fileParams": ["images"]},
+    )
+    async def muse_generate_video_from_images(
+        prompt: str,
+        images: list[OpenAIFileParam],
+        wait: bool = True,
+        timeout_seconds: float = 600.0,
+        min_videos: int = 1,
+        output_dir: str | None = None,
+    ) -> dict[str, Any]:
+        if not prompt.strip():
+            raise ValueError("prompt must not be empty")
+        if not images:
+            raise ValueError(
+                "images must contain at least one ChatGPT-uploaded reference file"
+            )
+        if timeout_seconds < 30 or timeout_seconds > 3600:
+            raise ValueError("timeout_seconds must be between 30 and 3600")
+        if min_videos < 1 or min_videos > 10:
+            raise ValueError("min_videos must be between 1 and 10")
+
+        if wait:
+            return await bridge.generate_video_wait(
+                prompt=prompt,
+                image_paths=None,
+                files=images,
+                timeout_seconds=timeout_seconds,
+                min_videos=min_videos,
+                download=True,
+                output_dir=output_dir,
+            )
+
+        return await bridge.submit_video_job(
+            prompt=prompt,
+            image_paths=None,
+            files=images,
+            timeout_seconds=timeout_seconds,
+            min_videos=min_videos,
+            download=True,
             output_dir=output_dir,
         )
 
