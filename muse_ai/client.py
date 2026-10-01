@@ -11,7 +11,13 @@ from urllib.parse import urlparse
 from .attachments import build_items
 from .auth import MuseAuth
 from .filesystem import MuseFilesystem
-from .media import VideoRef, extract_session_ids, extract_video_refs
+from .media import (
+    ImageRef,
+    VideoRef,
+    extract_image_refs,
+    extract_session_ids,
+    extract_video_refs,
+)
 from .routes import CHAT_CAPABILITIES
 from .text import (
     coalesce_text_fragments,
@@ -35,6 +41,16 @@ class GenerationResult:
 class TextResult:
     session_id: str | None
     text: str
+    stream_events: list[dict] = field(default_factory=list)
+    history: dict | list | None = None
+
+
+@dataclass(slots=True)
+class ImageGenerationResult:
+    session_id: str | None
+    images: list[ImageRef]
+    downloaded: list[Path] = field(default_factory=list)
+    download_errors: list[str] = field(default_factory=list)
     stream_events: list[dict] = field(default_factory=list)
     history: dict | list | None = None
 
@@ -479,6 +495,219 @@ class MuseClient:
         return GenerationResult(
             session_id=resolved_session,
             videos=videos,
+            downloaded=downloaded,
+            download_errors=download_errors,
+            stream_events=events,
+            history=latest_history,
+        )
+
+    async def wait_for_images(
+        self,
+        *,
+        session_id: str | None,
+        baseline: set[str],
+        timeout: float = 300.0,
+        poll_interval: float = 2.0,
+        settle_seconds: float = 2.0,
+        min_images: int = 1,
+    ) -> tuple[list[ImageRef], dict | list | None]:
+        deadline = time.monotonic() + timeout
+        first_found_at: float | None = None
+        latest_history = None
+        latest_refs: list[ImageRef] = []
+
+        while time.monotonic() < deadline:
+            latest_history = await self.history(session_id=session_id, limit=80)
+            refs = [
+                ref
+                for ref in extract_image_refs(latest_history)
+                if ref.identity not in baseline
+            ]
+            unique = {ref.identity: ref for ref in refs}
+            latest_refs = list(unique.values())
+
+            if len(latest_refs) >= min_images:
+                if first_found_at is None:
+                    first_found_at = time.monotonic()
+                if time.monotonic() - first_found_at >= settle_seconds:
+                    return latest_refs, latest_history
+            else:
+                first_found_at = None
+
+            await asyncio.sleep(poll_interval)
+
+        if latest_refs:
+            return latest_refs, latest_history
+
+        raise TimeoutError(
+            f"No new Muse image appeared within {timeout:.0f}s"
+            + (f" for session {session_id}" if session_id else "")
+        )
+
+    @staticmethod
+    def _image_filename_for(ref: ImageRef, index: int) -> str:
+        for candidate in (ref.label, ref.path, ref.url):
+            if not candidate:
+                continue
+            name = Path(urlparse(candidate).path).name
+            if name and "." in name:
+                return name
+
+        mime = (ref.mime_type or "").lower()
+        extension = {
+            "image/jpeg": ".jpg",
+            "image/jpg": ".jpg",
+            "image/webp": ".webp",
+            "image/gif": ".gif",
+            "image/avif": ".avif",
+        }.get(mime, ".png")
+        return f"muse_image_{index + 1}{extension}"
+
+    async def download_image(
+        self,
+        ref: ImageRef,
+        destination: str | Path,
+    ) -> Path:
+        target = Path(destination)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        attempts: list[str] = []
+
+        async def write_bytes(data: bytes) -> Path:
+            target.write_bytes(data)
+            return target
+
+        if ref.url and "/idea-cards/media/" in ref.url:
+            try:
+                return await write_bytes(
+                    await self._fs().idea_media_from_url(ref.url)
+                )
+            except Exception as exc:
+                attempts.append(f"variants.original idea-media: {exc}")
+
+        if ref.media_handle:
+            try:
+                return await write_bytes(
+                    await self._fs().idea_media(ref.media_handle)
+                )
+            except Exception as exc:
+                attempts.append(f"media_handle: {exc}")
+
+        if ref.url and ref.url.startswith(("http://", "https://")):
+            try:
+                response = await self.auth.browser.get(
+                    ref.url,
+                    allow_redirects=True,
+                )
+                if response.status_code >= 400:
+                    raise RuntimeError(
+                        f"HTTP {response.status_code}: {response.text[:200]}"
+                    )
+                return await write_bytes(response.content)
+            except Exception as exc:
+                attempts.append(f"direct URL: {exc}")
+
+        if ref.url and ref.url.startswith("sandbox://"):
+            try:
+                return await write_bytes(await self._fs().raw(ref.url))
+            except Exception as exc:
+                attempts.append(f"variants.original fs.raw: {exc}")
+
+        if ref.path:
+            try:
+                return await self._fs().download(ref.path, target)
+            except Exception as exc:
+                attempts.append(f"path fs.raw: {exc}")
+
+        detail = "; ".join(attempts) if attempts else "no usable media source"
+        raise RuntimeError(f"unable to download generated image: {detail}")
+
+    async def generate_image(
+        self,
+        *,
+        prompt: str,
+        output_dir: str | Path = "outputs",
+        session_id: str | None = None,
+        timeout: float = 300.0,
+        min_images: int = 1,
+        download: bool = True,
+    ) -> ImageGenerationResult:
+        """Generate image media through the same Muse chat stream.
+
+        Muse's web client represents generated images as presentation kind
+        "image" with data.images[] media records. The prompt is sent unchanged;
+        callers should explicitly ask Muse to create/generate an image.
+        """
+
+        if not prompt.strip():
+            raise ValueError("image generation requires a non-empty prompt")
+        if min_images < 1:
+            raise ValueError("min_images must be at least 1")
+
+        sessions_before: set[str] = set()
+        if session_id is None:
+            try:
+                sessions_before = set(
+                    extract_session_ids(await self.sessions_list())
+                )
+            except Exception:
+                pass
+
+        baseline_history = await self.history(
+            session_id=session_id,
+            limit=80,
+        )
+        baseline = {
+            ref.identity for ref in extract_image_refs(baseline_history)
+        }
+
+        events = await self.chat_stream(
+            prompt=prompt,
+            images=[],
+            session_id=session_id,
+        )
+        resolved_session = await self._resolve_session_id(
+            session_id,
+            events,
+            sessions_before,
+        )
+
+        images, latest_history = await self.wait_for_images(
+            session_id=resolved_session,
+            baseline=baseline,
+            timeout=timeout,
+            min_images=min_images,
+        )
+
+        downloaded: list[Path] = []
+        download_errors: list[str] = []
+        if download:
+            out = Path(output_dir)
+            out.mkdir(parents=True, exist_ok=True)
+            used: set[str] = set()
+
+            for index, ref in enumerate(images):
+                filename = self._image_filename_for(ref, index)
+                original = filename
+                suffix = 1
+                while filename in used or (out / filename).exists():
+                    stem = Path(original).stem
+                    ext = Path(original).suffix or ".png"
+                    filename = f"{stem}_{suffix}{ext}"
+                    suffix += 1
+                used.add(filename)
+
+                try:
+                    downloaded.append(
+                        await self.download_image(ref, out / filename)
+                    )
+                except Exception as exc:
+                    download_errors.append(
+                        f"image[{index + 1}] {ref.identity}: {exc}"
+                    )
+
+        return ImageGenerationResult(
+            session_id=resolved_session,
+            images=images,
             downloaded=downloaded,
             download_errors=download_errors,
             stream_events=events,
