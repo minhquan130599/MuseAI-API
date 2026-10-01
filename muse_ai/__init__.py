@@ -1,5 +1,5 @@
 from .auth import MuseAuth, MuseBootstrap
-from .client import GenerationResult, MuseClient
+from .client import GenerationResult, MuseClient, TextResult
 from .errors import MuseAuthError, MuseProtocolError, MuseRpcError
 
 __all__ = [
@@ -10,4 +10,5 @@ __all__ = [
     "MuseClient",
     "MuseProtocolError",
     "MuseRpcError",
+    "TextResult",
 ]

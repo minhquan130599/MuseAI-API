@@ -51,6 +51,186 @@ source .venv/bin/activate
 python -m pip install -U -e ".[dev]"
 ```
 
+## MCP Server
+
+The `mcp-server` branch exposes Muse as a Model Context Protocol server so Claude, Codex, VS Code agents, and other MCP-compatible clients can communicate with Muse directly.
+
+Install/update the project:
+
+```bat
+python -m pip install -U -e ".[dev]"
+```
+
+Authenticate Muse once before starting MCP:
+
+```bat
+muse-ai login --email YOUR_MUSE_EMAIL
+```
+
+### Start MCP over stdio
+
+```bat
+muse-mcp --transport stdio
+```
+
+or:
+
+```bat
+run_mcp.bat
+```
+
+The stdio transport is recommended for local agent integrations.
+
+### MCP tools
+
+| Tool | Purpose |
+| --- | --- |
+| `muse_auth_status` | Check whether the saved Muse session is valid |
+| `muse_ping` | Verify Muse → Hatch → Noise RPC connectivity |
+| `muse_model` | Read the active Muse model |
+| `muse_send_text` | Send text to Muse and receive the assistant response |
+| `muse_history` | Read chat history, optionally by session |
+| `muse_generate_video` | Generate video from text and optional local reference images |
+| `muse_job_status` | Poll an asynchronous video generation job |
+| `muse_list_jobs` | List video jobs created by the MCP process |
+| `muse_cancel_job` | Cancel a running asynchronous video job |
+
+### Text-in / text-out mode
+
+The primary agent-to-Muse tool is `muse_send_text`:
+
+```json
+{
+  "prompt": "Explain this idea in three concise bullet points.",
+  "timeout_seconds": 120
+}
+```
+
+Example result:
+
+```json
+{
+  "ok": true,
+  "session_id": "...",
+  "text": "..."
+}
+```
+
+To continue the same Muse conversation, pass the returned `session_id` into the next call:
+
+```json
+{
+  "prompt": "Now rewrite point 2 with more detail.",
+  "session_id": "SESSION_ID_FROM_PREVIOUS_RESULT"
+}
+```
+
+By default the MCP response does not include raw Muse stream/history payloads. Set `include_raw=true` only when debugging protocol behavior.
+
+### Video mode
+
+Blocking mode:
+
+```json
+{
+  "prompt": "Create a realistic 10-second vertical 9:16 cinematic coffee shop video.",
+  "wait": true,
+  "timeout_seconds": 600
+}
+```
+
+Asynchronous mode:
+
+```json
+{
+  "prompt": "Create a realistic 10-second vertical 9:16 cinematic coffee shop video.",
+  "wait": false,
+  "timeout_seconds": 600
+}
+```
+
+The asynchronous call immediately returns a `job_id`. Poll it with:
+
+```json
+{
+  "job_id": "JOB_ID"
+}
+```
+
+using `muse_job_status`.
+
+Generated MCP video files default to:
+
+```text
+.muse-mcp/
+└── outputs/
+    └── <job_id>/
+        └── *.mp4
+```
+
+### Claude / generic MCP client config
+
+See `examples/mcp-config.json`.
+
+Windows example:
+
+```json
+{
+  "mcpServers": {
+    "muse-ai": {
+      "command": "E:\\MCP\\codexpro-main\\Extensions\\MuseAI-API\\.venv\\Scripts\\python.exe",
+      "args": [
+        "-m",
+        "muse_ai.mcp_server",
+        "--transport",
+        "stdio",
+        "--state-dir",
+        "E:\\MCP\\codexpro-main\\Extensions\\MuseAI-API\\.muse-state"
+      ]
+    }
+  }
+}
+```
+
+### Codex config
+
+See `examples/codex-config.toml`.
+
+```toml
+[mcp_servers.muse-ai]
+command = "E:\\MCP\\codexpro-main\\Extensions\\MuseAI-API\\.venv\\Scripts\\python.exe"
+args = [
+  "-m",
+  "muse_ai.mcp_server",
+  "--transport",
+  "stdio",
+  "--state-dir",
+  "E:\\MCP\\codexpro-main\\Extensions\\MuseAI-API\\.muse-state",
+]
+```
+
+### Streamable HTTP mode
+
+For a long-running local MCP service:
+
+```bat
+muse-mcp --transport streamable-http --host 127.0.0.1 --port 8765
+```
+
+or:
+
+```bat
+run_mcp_http.bat
+```
+
+Endpoint:
+
+```text
+http://127.0.0.1:8765/mcp
+```
+
+The server binds to loopback by default. Do not expose the MCP HTTP endpoint publicly without adding authentication, network controls, and access restrictions because MCP tools can use your authenticated Muse account and optional local image paths.
+
 ## Web UI
 
 The `web-ui` branch includes a local FastAPI server and browser interface.

@@ -13,6 +13,11 @@ from .auth import MuseAuth
 from .filesystem import MuseFilesystem
 from .media import VideoRef, extract_session_ids, extract_video_refs
 from .routes import CHAT_CAPABILITIES
+from .text import (
+    coalesce_text_fragments,
+    extract_assistant_texts,
+    extract_text_fragments,
+)
 from .transport import HatchConnection, RpcResponse
 
 
@@ -22,6 +27,14 @@ class GenerationResult:
     videos: list[VideoRef]
     downloaded: list[Path] = field(default_factory=list)
     download_errors: list[str] = field(default_factory=list)
+    stream_events: list[dict] = field(default_factory=list)
+    history: dict | list | None = None
+
+
+@dataclass(slots=True)
+class TextResult:
+    session_id: str | None
+    text: str
     stream_events: list[dict] = field(default_factory=list)
     history: dict | list | None = None
 
@@ -141,6 +154,122 @@ class MuseClient:
             # tracking below does not depend on it remaining open.
             pass
         return events
+
+    async def send_text(
+        self,
+        *,
+        prompt: str,
+        session_id: str | None = None,
+        timeout: float = 120.0,
+        poll_interval: float = 1.5,
+    ) -> TextResult:
+        """Send a text prompt to Muse and return the assistant response."""
+
+        prompt = prompt.strip()
+        if not prompt:
+            raise ValueError("text prompt must not be empty")
+        if timeout <= 0:
+            raise ValueError("timeout must be greater than zero")
+
+        deadline = time.monotonic() + timeout
+
+        sessions_before: set[str] = set()
+        if session_id is None:
+            try:
+                sessions_before = set(
+                    extract_session_ids(await self.sessions_list())
+                )
+            except Exception:
+                pass
+
+        baseline_history = None
+        baseline_assistant: set[str] = set()
+        try:
+            baseline_history = await self.history(
+                session_id=session_id,
+                limit=80,
+            )
+            baseline_assistant = set(
+                extract_assistant_texts(baseline_history)
+            )
+        except Exception:
+            pass
+
+        remaining = max(1.0, deadline - time.monotonic())
+        events = await self.chat_stream(
+            prompt=prompt,
+            session_id=session_id,
+            stream_timeout=min(30.0, remaining),
+        )
+
+        resolved_session = await self._resolve_session_id(
+            session_id,
+            events,
+            sessions_before,
+        )
+
+        event_fragments = [
+            fragment
+            for fragment in extract_assistant_texts(events)
+            if fragment.strip() != prompt
+        ]
+        if not event_fragments:
+            event_fragments = [
+                fragment
+                for fragment in extract_text_fragments(events)
+                if fragment.strip() != prompt
+            ]
+
+        latest_history = baseline_history
+
+        while time.monotonic() < deadline:
+            try:
+                latest_history = await self.history(
+                    session_id=resolved_session,
+                    limit=80,
+                )
+                assistant_texts = [
+                    text
+                    for text in extract_assistant_texts(latest_history)
+                    if text not in baseline_assistant
+                    and text.strip() != prompt
+                ]
+                if assistant_texts:
+                    return TextResult(
+                        session_id=resolved_session,
+                        text=assistant_texts[-1],
+                        stream_events=events,
+                        history=latest_history,
+                    )
+            except Exception:
+                # A valid stream response remains usable if history is
+                # temporarily unavailable.
+                pass
+
+            await asyncio.sleep(
+                min(
+                    poll_interval,
+                    max(0.05, deadline - time.monotonic()),
+                )
+            )
+
+        stream_text = coalesce_text_fragments(event_fragments)
+        if stream_text:
+            return TextResult(
+                session_id=resolved_session,
+                text=stream_text,
+                stream_events=events,
+                history=latest_history,
+            )
+
+        raise TimeoutError(
+            f"No Muse text response appeared within {timeout:.0f}s"
+            + (
+                f" for session {resolved_session}"
+                if resolved_session
+                else ""
+            )
+        )
 
     async def _resolve_session_id(
         self,

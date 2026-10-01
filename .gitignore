@@ -7,5 +7,6 @@ build/
 *.egg-info/
 .muse-state/
 .muse-web/
+.muse-mcp/
 outputs/
 events.json

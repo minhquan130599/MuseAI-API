@@ -28,6 +28,15 @@ def build_parser() -> argparse.ArgumentParser:
     history.add_argument("--session-id")
     history.add_argument("--limit", type=int, default=40)
 
+    ask = sub.add_parser(
+        "ask",
+        help="Send text to Muse and print the assistant response",
+    )
+    ask.add_argument("--prompt", required=True)
+    ask.add_argument("--session-id")
+    ask.add_argument("--timeout", type=float, default=120)
+    ask.add_argument("--raw", action="store_true")
+
     generate = sub.add_parser(
         "generate",
         help="Generate video from a text prompt, optionally with reference images",
@@ -83,6 +92,28 @@ async def run(args: argparse.Namespace) -> int:
                 limit=args.limit,
             )
             print(json.dumps(value, ensure_ascii=False, indent=2))
+        elif args.command == "ask":
+            result = await client.send_text(
+                prompt=args.prompt,
+                session_id=args.session_id,
+                timeout=args.timeout,
+            )
+            if args.raw:
+                print(
+                    json.dumps(
+                        {
+                            "session_id": result.session_id,
+                            "text": result.text,
+                            "stream_events": result.stream_events,
+                            "history": result.history,
+                        },
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"session_id={result.session_id}")
+                print(result.text)
         elif args.command == "upload":
             remote = await client._fs().upload_file(
                 args.local_file,
