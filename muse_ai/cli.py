@@ -37,6 +37,17 @@ def build_parser() -> argparse.ArgumentParser:
     ask.add_argument("--timeout", type=float, default=120)
     ask.add_argument("--raw", action="store_true")
 
+    generate_image = sub.add_parser(
+        "generate-image",
+        help="Generate image(s) from a text prompt",
+    )
+    generate_image.add_argument("--prompt", required=True)
+    generate_image.add_argument("--output", default="outputs")
+    generate_image.add_argument("--session-id")
+    generate_image.add_argument("--timeout", type=float, default=300)
+    generate_image.add_argument("--min-images", type=int, default=1)
+    generate_image.add_argument("--no-download", action="store_true")
+
     generate = sub.add_parser(
         "generate",
         help="Generate video from a text prompt, optionally with reference images",
@@ -121,6 +132,26 @@ async def run(args: argparse.Namespace) -> int:
                 stage_before_publish=True,
             )
             print(remote)
+        elif args.command == "generate-image":
+            result = await client.generate_image(
+                prompt=args.prompt,
+                output_dir=args.output,
+                session_id=args.session_id,
+                timeout=args.timeout,
+                min_images=args.min_images,
+                download=not args.no_download,
+            )
+            print(f"session_id={result.session_id}")
+            for index, ref in enumerate(result.images, start=1):
+                print(
+                    f"image[{index}] path={ref.path!r} "
+                    f"url={ref.url!r} media_handle={ref.media_handle!r} "
+                    f"size={ref.width}x{ref.height}"
+                )
+            for path in result.downloaded:
+                print(f"downloaded: {path}")
+            for error in result.download_errors:
+                print(f"download warning: {error}")
         elif args.command == "generate":
             result = await client.generate_video(
                 prompt=args.prompt,
