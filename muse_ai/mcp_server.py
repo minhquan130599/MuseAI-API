@@ -47,20 +47,22 @@ def serialize_text_result(
 
 
 def serialize_generation_result(result: GenerationResult) -> dict[str, Any]:
+    # Do not expose Muse-internal paths/URLs to remote MCP clients. Those
+    # references are often bound to the Hatch VM/session and are not directly
+    # reachable from ChatGPT. _expose_downloaded_files() attaches public tunnel
+    # URLs after the media has been downloaded locally.
     return {
         "ok": True,
         "session_id": result.session_id,
         "videos": [
             {
-                "path": ref.path,
-                "url": ref.url,
-                "mime_type": ref.mime_type,
-                "resource_id": ref.resource_id,
-                "media_handle": ref.media_handle,
+                "mime_type": ref.mime_type or "video/mp4",
+                "url": None,
+                "download_url": None,
             }
             for ref in result.videos
         ],
-        "downloaded": [str(path.resolve()) for path in result.downloaded],
+        "download_count": len(result.downloaded),
         "download_errors": list(result.download_errors),
     }
 
@@ -68,23 +70,23 @@ def serialize_generation_result(result: GenerationResult) -> dict[str, Any]:
 def serialize_image_generation_result(
     result: ImageGenerationResult,
 ) -> dict[str, Any]:
+    # Keep only presentation metadata here. Muse-internal media URLs are not
+    # useful to remote MCP clients and can point at session-bound VM hosts.
     return {
         "ok": True,
         "session_id": result.session_id,
         "images": [
             {
-                "path": ref.path,
-                "url": ref.url,
                 "mime_type": ref.mime_type,
-                "resource_id": ref.resource_id,
-                "media_handle": ref.media_handle,
                 "label": ref.label,
                 "width": ref.width,
                 "height": ref.height,
+                "url": None,
+                "download_url": None,
             }
             for ref in result.images
         ],
-        "downloaded": [str(path.resolve()) for path in result.downloaded],
+        "download_count": len(result.downloaded),
         "download_errors": list(result.download_errors),
     }
 
@@ -290,6 +292,11 @@ class MuseMCPBridge:
                 if self.public_base_url
                 else None
             )
+            download_url = (
+                f"{public_url}?download=1"
+                if public_url
+                else None
+            )
             files.append(
                 {
                     "filename": path.name,
@@ -298,15 +305,23 @@ class MuseMCPBridge:
                         if path.suffix.lower() == ".mp4"
                         else None
                     ),
-                    "local_path": str(path),
                     "public_url": public_url,
-                    "download_url": (
-                        f"{public_url}?download=1"
-                        if public_url
-                        else None
-                    ),
+                    "download_url": download_url,
                 }
             )
+
+        media_items = payload.get("videos")
+        if not isinstance(media_items, list):
+            media_items = payload.get("images")
+        if isinstance(media_items, list):
+            for index, item in enumerate(media_items):
+                if not isinstance(item, dict) or index >= len(files):
+                    continue
+                public_file = files[index]
+                item["filename"] = public_file["filename"]
+                item["url"] = public_file["public_url"]
+                item["public_url"] = public_file["public_url"]
+                item["download_url"] = public_file["download_url"]
 
         payload["files"] = files
         payload["public_urls"] = [
@@ -668,10 +683,15 @@ def build_server(
         "MuseAI",
         instructions=(
             "Use Muse through the user's authenticated local session. "
-            "muse_send_text is the primary text-in/text-out tool. Preserve the "
-            "returned session_id and pass it back for multi-turn conversations. "
-            "For image or video generation, use wait=true for a blocking result "
-            "or wait=false plus muse_job_status for asynchronous operation."
+            "muse_send_text is only for normal text conversation; preserve its "
+            "returned session_id for multi-turn text chats. For any request to "
+            "create an image, call muse_generate_image. For any request to create "
+            "a video, call muse_generate_video. Never present Muse/Hatch internal "
+            "metaaivm.com media URLs to the user. Generation results expose "
+            "public_url/download_url fields backed by this MCP server; use those "
+            "links only. For image or video generation, use wait=true for a "
+            "blocking result or wait=false plus muse_job_status for asynchronous "
+            "operation."
         ),
         host=host,
         port=port,
@@ -727,6 +747,7 @@ def build_server(
     @server.tool(
         description=(
             "Send plain text to Muse and return Muse's assistant text response. "
+            "Use this only for text conversation, not for image/video generation. "
             "Pass the returned session_id into the next call to continue the "
             "same conversation."
         )
@@ -765,11 +786,12 @@ def build_server(
 
     @server.tool(
         description=(
-            "Generate image(s) in Muse from a text prompt. The prompt should "
-            "explicitly ask Muse to create an image. With wait=true this tool "
-            "waits for image presentation results and optionally downloads them. "
-            "With wait=false it returns a job_id immediately; use "
-            "muse_job_status to poll it."
+            "Generate image(s) in Muse from a text prompt. Use this tool for all "
+            "image-generation requests. With wait=true it waits for the result "
+            "and returns public_url/download_url links when public-base-url is "
+            "configured. Only surface those public links to the user; never use "
+            "Muse/Hatch internal media URLs. With wait=false it returns a job_id "
+            "immediately; use muse_job_status to poll it."
         )
     )
     async def muse_generate_image(
@@ -807,9 +829,12 @@ def build_server(
     @server.tool(
         description=(
             "Generate a Muse video from a text prompt, optionally with local "
-            "reference image paths. With wait=true this tool waits for the "
-            "video result. With wait=false it returns a job_id immediately; "
-            "use muse_job_status to poll it."
+            "reference image paths. Use this tool for all video-generation "
+            "requests. With wait=true it waits for the result and returns "
+            "public_url/download_url links when public-base-url is configured. "
+            "Only surface those public links to the user; never use Muse/Hatch "
+            "internal media URLs. With wait=false it returns a job_id "
+            "immediately; use muse_job_status to poll it."
         )
     )
     async def muse_generate_video(
