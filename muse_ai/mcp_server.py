@@ -13,7 +13,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from .auth import MuseAuth
-from .client import GenerationResult, MuseClient, TextResult
+from .client import GenerationResult, ImageGenerationResult, MuseClient, TextResult
 
 DEFAULT_STATE_DIR = Path(os.environ.get("MUSE_STATE_DIR", ".muse-state"))
 DEFAULT_MCP_DIR = Path(os.environ.get("MUSE_MCP_DIR", ".muse-mcp"))
@@ -61,10 +61,35 @@ def serialize_generation_result(result: GenerationResult) -> dict[str, Any]:
     }
 
 
+def serialize_image_generation_result(
+    result: ImageGenerationResult,
+) -> dict[str, Any]:
+    return {
+        "ok": True,
+        "session_id": result.session_id,
+        "images": [
+            {
+                "path": ref.path,
+                "url": ref.url,
+                "mime_type": ref.mime_type,
+                "resource_id": ref.resource_id,
+                "media_handle": ref.media_handle,
+                "label": ref.label,
+                "width": ref.width,
+                "height": ref.height,
+            }
+            for ref in result.images
+        ],
+        "downloaded": [str(path.resolve()) for path in result.downloaded],
+        "download_errors": list(result.download_errors),
+    }
+
+
 @dataclass(slots=True)
 class VideoJob:
     id: str
     prompt: str
+    kind: str = "video"
     status: str = "queued"
     created_at: str = field(default_factory=utc_now)
     started_at: str | None = None
@@ -78,6 +103,7 @@ class VideoJob:
         return {
             "id": self.id,
             "prompt": self.prompt,
+            "kind": self.kind,
             "status": self.status,
             "created_at": self.created_at,
             "started_at": self.started_at,
@@ -345,6 +371,109 @@ class MuseMCPBridge:
             if client is not None:
                 await client.close()
 
+    async def generate_image_wait(
+        self,
+        *,
+        prompt: str,
+        timeout_seconds: float,
+        min_images: int,
+        download: bool,
+        output_dir: str | None,
+    ) -> dict[str, Any]:
+        client = await self._new_client()
+        try:
+            result = await client.generate_image(
+                prompt=prompt,
+                output_dir=Path(output_dir).expanduser()
+                if output_dir
+                else self.output_dir,
+                timeout=timeout_seconds,
+                min_images=min_images,
+                download=download,
+            )
+            return serialize_image_generation_result(result)
+        finally:
+            await client.close()
+
+    async def submit_image_job(
+        self,
+        *,
+        prompt: str,
+        timeout_seconds: float,
+        min_images: int,
+        download: bool,
+        output_dir: str | None,
+    ) -> dict[str, Any]:
+        job_id = uuid.uuid4().hex[:12]
+        job = VideoJob(id=job_id, prompt=prompt, kind="image")
+
+        async with self._jobs_lock:
+            self.jobs[job_id] = job
+
+        task = asyncio.create_task(
+            self._run_image_job(
+                job,
+                timeout_seconds=timeout_seconds,
+                min_images=min_images,
+                download=download,
+                output_dir=output_dir,
+            ),
+            name=f"muse-mcp-image-{job_id}",
+        )
+        job.task = task
+        return {
+            "ok": True,
+            "job_id": job_id,
+            "kind": "image",
+            "status": "queued",
+            "message": (
+                "Image generation submitted. Call muse_job_status with this "
+                "job_id until status is completed or failed."
+            ),
+        }
+
+    async def _run_image_job(
+        self,
+        job: VideoJob,
+        *,
+        timeout_seconds: float,
+        min_images: int,
+        download: bool,
+        output_dir: str | None,
+    ) -> None:
+        job.status = "connecting"
+        job.started_at = utc_now()
+        client: MuseClient | None = None
+        try:
+            client = await self._new_client()
+            job.status = "generating"
+            destination = (
+                Path(output_dir).expanduser()
+                if output_dir
+                else self.output_dir / job.id
+            )
+            result = await client.generate_image(
+                prompt=job.prompt,
+                output_dir=destination,
+                timeout=timeout_seconds,
+                min_images=min_images,
+                download=download,
+            )
+            job.session_id = result.session_id
+            job.result = serialize_image_generation_result(result)
+            job.status = "completed"
+        except asyncio.CancelledError:
+            job.status = "cancelled"
+            job.error = "job cancelled"
+            raise
+        except Exception as exc:
+            job.status = "failed"
+            job.error = f"{type(exc).__name__}: {exc}"
+        finally:
+            job.finished_at = utc_now()
+            if client is not None:
+                await client.close()
+
     async def job_status(self, job_id: str) -> dict[str, Any]:
         async with self._jobs_lock:
             job = self.jobs.get(job_id)
@@ -423,8 +552,8 @@ def build_server(
             "Use Muse through the user's authenticated local session. "
             "muse_send_text is the primary text-in/text-out tool. Preserve the "
             "returned session_id and pass it back for multi-turn conversations. "
-            "For video generation, use wait=true for a blocking result or "
-            "wait=false plus muse_job_status for asynchronous operation."
+            "For image or video generation, use wait=true for a blocking result "
+            "or wait=false plus muse_job_status for asynchronous operation."
         ),
         host=host,
         port=port,
@@ -495,6 +624,47 @@ def build_server(
 
     @server.tool(
         description=(
+            "Generate image(s) in Muse from a text prompt. The prompt should "
+            "explicitly ask Muse to create an image. With wait=true this tool "
+            "waits for image presentation results and optionally downloads them. "
+            "With wait=false it returns a job_id immediately; use "
+            "muse_job_status to poll it."
+        )
+    )
+    async def muse_generate_image(
+        prompt: str,
+        wait: bool = True,
+        timeout_seconds: float = 300.0,
+        min_images: int = 1,
+        download: bool = True,
+        output_dir: str | None = None,
+    ) -> dict[str, Any]:
+        if not prompt.strip():
+            raise ValueError("prompt must not be empty")
+        if timeout_seconds < 15 or timeout_seconds > 1800:
+            raise ValueError("timeout_seconds must be between 15 and 1800")
+        if min_images < 1 or min_images > 12:
+            raise ValueError("min_images must be between 1 and 12")
+
+        if wait:
+            return await bridge.generate_image_wait(
+                prompt=prompt,
+                timeout_seconds=timeout_seconds,
+                min_images=min_images,
+                download=download,
+                output_dir=output_dir,
+            )
+
+        return await bridge.submit_image_job(
+            prompt=prompt,
+            timeout_seconds=timeout_seconds,
+            min_images=min_images,
+            download=download,
+            output_dir=output_dir,
+        )
+
+    @server.tool(
+        description=(
             "Generate a Muse video from a text prompt, optionally with local "
             "reference image paths. With wait=true this tool waits for the "
             "video result. With wait=false it returns a job_id immediately; "
@@ -538,15 +708,15 @@ def build_server(
 
     @server.tool(
         description=(
-            "Get the status/result of an asynchronous Muse video generation "
-            "job returned by muse_generate_video(wait=false)."
+            "Get the status/result of an asynchronous Muse image or video "
+            "generation job returned by a generation tool with wait=false."
         )
     )
     async def muse_job_status(job_id: str) -> dict[str, Any]:
         return await bridge.job_status(job_id)
 
     @server.tool(
-        description="List video generation jobs created by this MCP process."
+        description="List image/video generation jobs created by this MCP process."
     )
     async def muse_list_jobs(limit: int = 20) -> dict[str, Any]:
         if limit < 1 or limit > 100:
