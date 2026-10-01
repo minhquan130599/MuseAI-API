@@ -15,6 +15,7 @@ from muse_ai.mcp_server import (
     serialize_generation_result,
     serialize_image_generation_result,
     serialize_text_result,
+    scrub_internal_media_urls,
 )
 from muse_ai.text import (
     coalesce_text_fragments,
@@ -67,6 +68,25 @@ def test_serialize_text_result_hides_raw_by_default():
         "session_id": "session-1",
         "text": "answer",
     }
+
+
+def test_scrub_internal_media_urls_recursively():
+    payload = {
+        "text": (
+            "watch https://abc.metaaivm.com/media/raw/workspace/video.mp4 "
+            "now"
+        ),
+        "nested": [
+            {
+                "url": (
+                    "https://vm.metaaivm.com/media/raw/workspace/image.webp"
+                )
+            }
+        ],
+    }
+    cleaned = scrub_internal_media_urls(payload)
+    assert "metaaivm.com" not in repr(cleaned)
+    assert "public_url/download_url" in cleaned["text"]
 
 
 def test_serialize_image_generation_result_hides_internal_media(tmp_path):
@@ -149,12 +169,17 @@ async def test_mcp_server_registers_expected_tools(tmp_path):
         "muse_history",
         "muse_generate_image",
         "muse_generate_video",
+        "muse_generate_video_from_images",
         "muse_job_status",
         "muse_list_jobs",
         "muse_cancel_job",
     } <= set(by_name)
 
-    for tool_name in ("muse_generate_image", "muse_generate_video"):
+    for tool_name in (
+        "muse_generate_image",
+        "muse_generate_video",
+        "muse_generate_video_from_images",
+    ):
         tool = by_name[tool_name]
         assert tool.meta == {"openai/fileParams": ["images"]}
         file_schema = tool.inputSchema["$defs"]["OpenAIFileParam"]
@@ -167,8 +192,50 @@ async def test_mcp_server_registers_expected_tools(tmp_path):
         assert file_schema["required"] == ["download_url", "file_id"]
         assert file_schema["additionalProperties"] is False
 
+    upload_video_schema = by_name[
+        "muse_generate_video_from_images"
+    ].inputSchema
+    assert set(upload_video_schema["required"]) == {"prompt", "images"}
+
     bridge = server._muse_bridge
     await bridge.close()
+
+
+@pytest.mark.asyncio
+async def test_public_base_url_forces_video_download(tmp_path, monkeypatch):
+    bridge = MuseMCPBridge(
+        output_dir=tmp_path / "output",
+        public_base_url="https://example.trycloudflare.com",
+    )
+    seen: dict[str, bool] = {}
+
+    class FakeClient:
+        async def generate_video(self, **kwargs):
+            seen["download"] = kwargs["download"]
+            return GenerationResult(
+                session_id="session-force-download",
+                videos=[],
+                downloaded=[],
+            )
+
+        async def close(self):
+            return None
+
+    async def fake_new_client():
+        return FakeClient()
+
+    monkeypatch.setattr(bridge, "_new_client", fake_new_client)
+
+    await bridge.generate_video_wait(
+        prompt="create video",
+        image_paths=None,
+        files=None,
+        timeout_seconds=30,
+        min_videos=1,
+        download=False,
+        output_dir=None,
+    )
+    assert seen["download"] is True
 
 
 @pytest.mark.asyncio
