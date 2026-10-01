@@ -90,10 +90,11 @@ The stdio transport is recommended for local agent integrations.
 | `muse_model` | Read the active Muse model |
 | `muse_send_text` | Send text to Muse and receive the assistant response |
 | `muse_history` | Read chat history, optionally by session |
+| `muse_generate_image` | Generate image(s) from a text prompt |
 | `muse_generate_video` | Generate video from text and optional local reference images |
-| `muse_job_status` | Poll an asynchronous video generation job |
-| `muse_list_jobs` | List video jobs created by the MCP process |
-| `muse_cancel_job` | Cancel a running asynchronous video job |
+| `muse_job_status` | Poll an asynchronous image/video generation job |
+| `muse_list_jobs` | List image/video jobs created by the MCP process |
+| `muse_cancel_job` | Cancel a running asynchronous image/video job |
 
 ### Text-in / text-out mode
 
@@ -126,6 +127,44 @@ To continue the same Muse conversation, pass the returned `session_id` into the 
 ```
 
 By default the MCP response does not include raw Muse stream/history payloads. Set `include_raw=true` only when debugging protocol behavior.
+
+### Image mode
+
+Muse exposes generated images as presentation kind `image` with `data.images[]` media records. The MCP bridge waits for those image presentations and downloads the media through the same Hatch media path used by the web client.
+
+Blocking mode:
+
+```json
+{
+  "prompt": "Create a photorealistic square image of a modern coffee shop at night, warm lighting, no text.",
+  "wait": true,
+  "timeout_seconds": 300,
+  "min_images": 1
+}
+```
+
+Asynchronous mode:
+
+```json
+{
+  "prompt": "Create a photorealistic vertical poster-style image of Hanoi at night, no text.",
+  "wait": false,
+  "timeout_seconds": 300
+}
+```
+
+The async call returns a `job_id`. Poll the same generic `muse_job_status` tool until the job is `completed` or `failed`.
+
+Downloaded image results are returned with metadata such as `path`, `mime_type`, `media_handle`, `width`, `height`, and local downloaded paths.
+
+CLI smoke test:
+
+```bat
+muse-ai generate-image ^
+  --prompt "Create a photorealistic square image of a futuristic Hanoi street at night, neon reflections, no text." ^
+  --output outputs ^
+  --timeout 300
+```
 
 ### Video mode
 
