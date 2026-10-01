@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import mimetypes
 import os
+import shutil
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
@@ -11,8 +13,10 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from pydantic import BaseModel, ConfigDict
 from starlette.requests import Request
 from starlette.responses import FileResponse, PlainTextResponse, Response
 
@@ -24,6 +28,23 @@ DEFAULT_MCP_DIR = Path(os.environ.get("MUSE_MCP_DIR", ".muse-mcp"))
 DEFAULT_OUTPUT_DIR = Path(
     os.environ.get("MUSE_MCP_OUTPUT_DIR", str(DEFAULT_MCP_DIR / "outputs"))
 )
+DEFAULT_UPLOAD_DIR = Path(
+    os.environ.get("MUSE_MCP_UPLOAD_DIR", str(DEFAULT_MCP_DIR / "uploads"))
+)
+MAX_IMPORTED_FILE_BYTES = int(
+    os.environ.get("MUSE_MCP_MAX_FILE_BYTES", str(32 * 1024 * 1024))
+)
+
+
+class OpenAIFileParam(BaseModel):
+    """ChatGPT file object passed through openai/fileParams."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    download_url: str
+    file_id: str
+    mime_type: str | None = None
+    file_name: str | None = None
 
 
 def utc_now() -> str:
@@ -132,10 +153,12 @@ class MuseMCPBridge:
     ) -> None:
         self.state_dir = Path(state_dir)
         self.output_dir = Path(output_dir)
+        self.upload_dir = DEFAULT_UPLOAD_DIR
         self.public_base_url = (
             public_base_url.rstrip("/") if public_base_url else None
         )
         self.output_dir.mkdir(parents=True, exist_ok=True)
+        self.upload_dir.mkdir(parents=True, exist_ok=True)
         self._text_client: MuseClient | None = None
         self._text_connect_lock = asyncio.Lock()
         self._text_call_lock = asyncio.Lock()
@@ -273,6 +296,104 @@ class MuseMCPBridge:
             images.append(path)
         return images
 
+    @staticmethod
+    def _safe_upload_name(
+        file: OpenAIFileParam,
+        index: int,
+    ) -> str:
+        raw = (file.file_name or "").replace("\\", "/")
+        name = Path(raw).name.strip()
+        if not name:
+            suffix = mimetypes.guess_extension(file.mime_type or "") or ".bin"
+            name = f"{file.file_id or f'upload-{index + 1}'}{suffix}"
+
+        safe = "".join(
+            ch for ch in name if ch.isalnum() or ch in "._- ()[]"
+        ).strip(" .")
+        return safe[:180] or f"upload-{index + 1}.bin"
+
+    async def _download_openai_files(
+        self,
+        files: list[OpenAIFileParam] | None,
+    ) -> tuple[list[Path], Path | None]:
+        if not files:
+            return [], None
+
+        request_dir = self.upload_dir / uuid.uuid4().hex
+        request_dir.mkdir(parents=True, exist_ok=False)
+        downloaded: list[Path] = []
+
+        try:
+            async with httpx.AsyncClient(
+                follow_redirects=True,
+                timeout=httpx.Timeout(90.0),
+            ) as client:
+                for index, file in enumerate(files):
+                    parsed = urlparse(file.download_url)
+                    if parsed.scheme != "https" or not parsed.netloc:
+                        raise ValueError(
+                            "ChatGPT file download_url must be an absolute "
+                            "HTTPS URL"
+                        )
+
+                    filename = self._safe_upload_name(file, index)
+                    target = request_dir / f"{index + 1:02d}-{filename}"
+                    total = 0
+
+                    async with client.stream(
+                        "GET",
+                        file.download_url,
+                    ) as response:
+                        response.raise_for_status()
+                        content_type = response.headers.get(
+                            "content-type",
+                            "",
+                        ).lower()
+
+                        if (
+                            file.mime_type
+                            and content_type
+                            and content_type.startswith(("image/", "video/"))
+                            and not content_type.startswith(
+                                file.mime_type.lower()
+                            )
+                        ):
+                            raise ValueError(
+                                "uploaded file content type mismatch: "
+                                f"{content_type!r}"
+                            )
+
+                        with target.open("wb") as handle:
+                            async for chunk in response.aiter_bytes():
+                                total += len(chunk)
+                                if total > MAX_IMPORTED_FILE_BYTES:
+                                    raise ValueError(
+                                        "uploaded file exceeds MCP import "
+                                        f"limit ({MAX_IMPORTED_FILE_BYTES} bytes)"
+                                    )
+                                handle.write(chunk)
+
+                    if total == 0:
+                        raise ValueError(
+                            "uploaded file download returned no data"
+                        )
+                    downloaded.append(target)
+
+            return downloaded, request_dir
+        except Exception:
+            shutil.rmtree(request_dir, ignore_errors=True)
+            raise
+
+    async def _prepare_reference_images(
+        self,
+        *,
+        image_paths: list[str] | None,
+        files: list[OpenAIFileParam] | None,
+    ) -> tuple[list[Path], Path | None]:
+        local = self._normalize_images(image_paths)
+        imported, request_dir = await self._download_openai_files(files)
+        return [*local, *imported], request_dir
+
     def _expose_downloaded_files(
         self,
         payload: dict[str, Any],
@@ -353,16 +474,21 @@ class MuseMCPBridge:
         *,
         prompt: str,
         image_paths: list[str] | None,
+        files: list[OpenAIFileParam] | None,
         timeout_seconds: float,
         min_videos: int,
         download: bool,
         output_dir: str | None,
     ) -> dict[str, Any]:
+        images, request_dir = await self._prepare_reference_images(
+            image_paths=image_paths,
+            files=files,
+        )
         client = await self._new_client()
         try:
             result = await client.generate_video(
                 prompt=prompt,
-                images=self._normalize_images(image_paths),
+                images=images,
                 output_dir=Path(output_dir).expanduser()
                 if output_dir
                 else self.output_dir,
@@ -376,18 +502,24 @@ class MuseMCPBridge:
             )
         finally:
             await client.close()
+            if request_dir is not None:
+                shutil.rmtree(request_dir, ignore_errors=True)
 
     async def submit_video_job(
         self,
         *,
         prompt: str,
         image_paths: list[str] | None,
+        files: list[OpenAIFileParam] | None,
         timeout_seconds: float,
         min_videos: int,
         download: bool,
         output_dir: str | None,
     ) -> dict[str, Any]:
-        images = self._normalize_images(image_paths)
+        images, request_dir = await self._prepare_reference_images(
+            image_paths=image_paths,
+            files=files,
+        )
         job_id = uuid.uuid4().hex[:12]
         job = VideoJob(id=job_id, prompt=prompt)
 
@@ -402,6 +534,7 @@ class MuseMCPBridge:
                 min_videos=min_videos,
                 download=download,
                 output_dir=output_dir,
+                request_dir=request_dir,
             ),
             name=f"muse-mcp-video-{job_id}",
         )
@@ -425,6 +558,7 @@ class MuseMCPBridge:
         min_videos: int,
         download: bool,
         output_dir: str | None,
+        request_dir: Path | None,
     ) -> None:
         job.status = "connecting"
         job.started_at = utc_now()
@@ -462,20 +596,29 @@ class MuseMCPBridge:
             job.finished_at = utc_now()
             if client is not None:
                 await client.close()
+            if request_dir is not None:
+                shutil.rmtree(request_dir, ignore_errors=True)
 
     async def generate_image_wait(
         self,
         *,
         prompt: str,
+        image_paths: list[str] | None,
+        files: list[OpenAIFileParam] | None,
         timeout_seconds: float,
         min_images: int,
         download: bool,
         output_dir: str | None,
     ) -> dict[str, Any]:
+        images, request_dir = await self._prepare_reference_images(
+            image_paths=image_paths,
+            files=files,
+        )
         client = await self._new_client()
         try:
             result = await client.generate_image(
                 prompt=prompt,
+                images=images,
                 output_dir=Path(output_dir).expanduser()
                 if output_dir
                 else self.output_dir,
@@ -489,16 +632,24 @@ class MuseMCPBridge:
             )
         finally:
             await client.close()
+            if request_dir is not None:
+                shutil.rmtree(request_dir, ignore_errors=True)
 
     async def submit_image_job(
         self,
         *,
         prompt: str,
+        image_paths: list[str] | None,
+        files: list[OpenAIFileParam] | None,
         timeout_seconds: float,
         min_images: int,
         download: bool,
         output_dir: str | None,
     ) -> dict[str, Any]:
+        images, request_dir = await self._prepare_reference_images(
+            image_paths=image_paths,
+            files=files,
+        )
         job_id = uuid.uuid4().hex[:12]
         job = VideoJob(id=job_id, prompt=prompt, kind="image")
 
@@ -508,10 +659,12 @@ class MuseMCPBridge:
         task = asyncio.create_task(
             self._run_image_job(
                 job,
+                images=images,
                 timeout_seconds=timeout_seconds,
                 min_images=min_images,
                 download=download,
                 output_dir=output_dir,
+                request_dir=request_dir,
             ),
             name=f"muse-mcp-image-{job_id}",
         )
@@ -531,10 +684,12 @@ class MuseMCPBridge:
         self,
         job: VideoJob,
         *,
+        images: list[Path],
         timeout_seconds: float,
         min_images: int,
         download: bool,
         output_dir: str | None,
+        request_dir: Path | None,
     ) -> None:
         job.status = "connecting"
         job.started_at = utc_now()
@@ -549,6 +704,7 @@ class MuseMCPBridge:
             )
             result = await client.generate_image(
                 prompt=job.prompt,
+                images=images,
                 output_dir=destination,
                 timeout=timeout_seconds,
                 min_images=min_images,
@@ -571,6 +727,8 @@ class MuseMCPBridge:
             job.finished_at = utc_now()
             if client is not None:
                 await client.close()
+            if request_dir is not None:
+                shutil.rmtree(request_dir, ignore_errors=True)
 
     async def job_status(self, job_id: str) -> dict[str, Any]:
         async with self._jobs_lock:
@@ -786,16 +944,20 @@ def build_server(
 
     @server.tool(
         description=(
-            "Generate image(s) in Muse from a text prompt. Use this tool for all "
-            "image-generation requests. With wait=true it waits for the result "
+            "Generate image(s) in Muse from a text prompt. Optional ChatGPT-uploaded "
+            "reference images are accepted through the images parameter; local "
+            "agents may use image_paths. With wait=true it waits for the result "
             "and returns public_url/download_url links when public-base-url is "
             "configured. Only surface those public links to the user; never use "
             "Muse/Hatch internal media URLs. With wait=false it returns a job_id "
             "immediately; use muse_job_status to poll it."
-        )
+        ),
+        meta={"openai/fileParams": ["images"]},
     )
     async def muse_generate_image(
         prompt: str,
+        images: list[OpenAIFileParam] | None = None,
+        image_paths: list[str] | None = None,
         wait: bool = True,
         timeout_seconds: float = 300.0,
         min_images: int = 1,
@@ -812,6 +974,8 @@ def build_server(
         if wait:
             return await bridge.generate_image_wait(
                 prompt=prompt,
+                image_paths=image_paths,
+                files=images,
                 timeout_seconds=timeout_seconds,
                 min_images=min_images,
                 download=download,
@@ -820,6 +984,8 @@ def build_server(
 
         return await bridge.submit_image_job(
             prompt=prompt,
+            image_paths=image_paths,
+            files=images,
             timeout_seconds=timeout_seconds,
             min_images=min_images,
             download=download,
@@ -828,17 +994,20 @@ def build_server(
 
     @server.tool(
         description=(
-            "Generate a Muse video from a text prompt, optionally with local "
-            "reference image paths. Use this tool for all video-generation "
-            "requests. With wait=true it waits for the result and returns "
+            "Generate a Muse video from a text prompt. ChatGPT-uploaded reference "
+            "images are accepted through the images parameter; local agents may "
+            "use image_paths. Use this tool for all video-generation requests. "
+            "With wait=true it waits for the result and returns "
             "public_url/download_url links when public-base-url is configured. "
             "Only surface those public links to the user; never use Muse/Hatch "
             "internal media URLs. With wait=false it returns a job_id "
             "immediately; use muse_job_status to poll it."
-        )
+        ),
+        meta={"openai/fileParams": ["images"]},
     )
     async def muse_generate_video(
         prompt: str,
+        images: list[OpenAIFileParam] | None = None,
         image_paths: list[str] | None = None,
         wait: bool = True,
         timeout_seconds: float = 600.0,
@@ -857,6 +1026,7 @@ def build_server(
             return await bridge.generate_video_wait(
                 prompt=prompt,
                 image_paths=image_paths,
+                files=images,
                 timeout_seconds=timeout_seconds,
                 min_videos=min_videos,
                 download=download,
@@ -866,6 +1036,7 @@ def build_server(
         return await bridge.submit_video_job(
             prompt=prompt,
             image_paths=image_paths,
+            files=images,
             timeout_seconds=timeout_seconds,
             min_videos=min_videos,
             download=download,
