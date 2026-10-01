@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
+from mcp.server.transport_security import TransportSecuritySettings
 
 from .auth import MuseAuth
 from .client import GenerationResult, ImageGenerationResult, MuseClient, TextResult
@@ -533,6 +534,8 @@ def build_server(
     port: int = 8765,
     state_dir: str | Path = DEFAULT_STATE_DIR,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    allowed_hosts: list[str] | None = None,
+    allowed_origins: list[str] | None = None,
 ) -> FastMCP:
     bridge = MuseMCPBridge(
         state_dir=state_dir,
@@ -545,6 +548,22 @@ def build_server(
             yield {"bridge": bridge}
         finally:
             await bridge.close()
+
+    transport_security = TransportSecuritySettings(
+        enable_dns_rebinding_protection=True,
+        allowed_hosts=[
+            "127.0.0.1:*",
+            "localhost:*",
+            "[::1]:*",
+            *(allowed_hosts or []),
+        ],
+        allowed_origins=[
+            "http://127.0.0.1:*",
+            "http://localhost:*",
+            "http://[::1]:*",
+            *(allowed_origins or []),
+        ],
+    )
 
     server = FastMCP(
         "MuseAI",
@@ -559,6 +578,7 @@ def build_server(
         port=port,
         streamable_http_path="/mcp",
         json_response=True,
+        transport_security=transport_security,
         lifespan=lifespan,
     )
 
@@ -754,6 +774,32 @@ def main() -> None:
         default=int(os.environ.get("MUSE_MCP_PORT", "8765")),
     )
     parser.add_argument(
+        "--allowed-host",
+        action="append",
+        default=[
+            value.strip()
+            for value in os.environ.get("MUSE_MCP_ALLOWED_HOSTS", "").split(",")
+            if value.strip()
+        ],
+        help=(
+            "Additional exact Host header allowed by MCP DNS-rebinding "
+            "protection. Repeat for multiple hosts."
+        ),
+    )
+    parser.add_argument(
+        "--allowed-origin",
+        action="append",
+        default=[
+            value.strip()
+            for value in os.environ.get("MUSE_MCP_ALLOWED_ORIGINS", "").split(",")
+            if value.strip()
+        ],
+        help=(
+            "Additional exact Origin allowed by MCP DNS-rebinding protection. "
+            "Repeat for multiple origins."
+        ),
+    )
+    parser.add_argument(
         "--state-dir",
         default=os.environ.get("MUSE_STATE_DIR", str(DEFAULT_STATE_DIR)),
         help="Directory containing cookies.json/device.json from muse-ai login.",
@@ -772,6 +818,8 @@ def main() -> None:
         port=args.port,
         state_dir=args.state_dir,
         output_dir=args.output_dir,
+        allowed_hosts=args.allowed_host,
+        allowed_origins=args.allowed_origin,
     )
     server.run(transport=args.transport)
 
