@@ -1,0 +1,10 @@
+[mcp_servers.muse-ai]
+command = "E:\\MCP\\codexpro-main\\Extensions\\MuseAI-API\\.venv\\Scripts\\python.exe"
+args = [
+  "-m",
+  "muse_ai.mcp_server",
+  "--transport",
+  "stdio",
+  "--state-dir",
+  "E:\\MCP\\codexpro-main\\Extensions\\MuseAI-API\\.muse-state",
+]
