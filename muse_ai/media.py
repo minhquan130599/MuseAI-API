@@ -15,7 +15,28 @@ class VideoRef:
 
     @property
     def identity(self) -> str:
-        # Signed URLs can rotate while the generated file itself is unchanged.
+        return (
+            self.path
+            or self.resource_id
+            or self.media_handle
+            or self.url
+            or repr(self)
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class ImageRef:
+    path: str | None = None
+    url: str | None = None
+    mime_type: str | None = None
+    resource_id: str | None = None
+    media_handle: str | None = None
+    label: str | None = None
+    width: int | None = None
+    height: int | None = None
+
+    @property
+    def identity(self) -> str:
         return (
             self.path
             or self.resource_id
@@ -31,11 +52,25 @@ def _is_video_mime(value: Any) -> bool:
     )
 
 
+def _is_image_mime(value: Any) -> bool:
+    return isinstance(value, str) and (
+        value.lower().startswith("image/")
+        or value.lower() in {"png", "jpg", "jpeg", "webp", "gif", "avif"}
+    )
+
+
 def _looks_video_path(value: Any) -> bool:
     if not isinstance(value, str):
         return False
     clean = value.lower().split("?", 1)[0].split("#", 1)[0]
     return clean.endswith((".mp4", ".webm", ".mov", ".m4v"))
+
+
+def _looks_image_path(value: Any) -> bool:
+    if not isinstance(value, str):
+        return False
+    clean = value.lower().split("?", 1)[0].split("#", 1)[0]
+    return clean.endswith((".png", ".jpg", ".jpeg", ".webp", ".gif", ".avif"))
 
 
 def extract_session_ids(value: Any) -> list[str]:
@@ -64,20 +99,20 @@ def extract_video_refs(value: Any) -> list[VideoRef]:
             return
 
         aliases = {
-            value
-            for value in (ref.path, ref.url, ref.resource_id, ref.media_handle)
-            if value
+            item
+            for item in (ref.path, ref.url, ref.resource_id, ref.media_handle)
+            if item
         }
         for existing_key, existing in list(found.items()):
             existing_aliases = {
-                value
-                for value in (
+                item
+                for item in (
                     existing.path,
                     existing.url,
                     existing.resource_id,
                     existing.media_handle,
                 )
-                if value
+                if item
             }
             if aliases & existing_aliases:
                 merged = VideoRef(
@@ -126,12 +161,8 @@ def extract_video_refs(value: Any) -> list[VideoRef]:
                             else url if isinstance(url, str) else None
                         ),
                         mime_type=mime if isinstance(mime, str) else None,
-                        resource_id=(
-                            resource_id if isinstance(resource_id, str) else None
-                        ),
-                        media_handle=(
-                            media_handle if isinstance(media_handle, str) else None
-                        ),
+                        resource_id=resource_id if isinstance(resource_id, str) else None,
+                        media_handle=media_handle if isinstance(media_handle, str) else None,
                     )
                 )
             for item in node.values():
@@ -152,6 +183,128 @@ def extract_video_refs(value: Any) -> list[VideoRef]:
                     add(VideoRef(url=node))
                 else:
                     add(VideoRef(path=node))
+
+    walk(value)
+    return list(found.values())
+
+
+def extract_image_refs(value: Any) -> list[ImageRef]:
+    """Extract Muse image presentation media refs.
+
+    The Muse web bundle defines HATCH_PRESENTATION_KIND_IMAGE == "image".
+    Presentation payloads contain data.images[] records with sandbox workspace
+    paths plus optional mime, media_handle/mediaHandle, width, height, and
+    variants.original.
+    """
+
+    found: dict[str, ImageRef] = {}
+
+    def add(ref: ImageRef) -> None:
+        if not (ref.path or ref.url or ref.media_handle):
+            return
+
+        aliases = {
+            item
+            for item in (ref.path, ref.url, ref.resource_id, ref.media_handle)
+            if item
+        }
+        for existing_key, existing in list(found.items()):
+            existing_aliases = {
+                item
+                for item in (
+                    existing.path,
+                    existing.url,
+                    existing.resource_id,
+                    existing.media_handle,
+                )
+                if item
+            }
+            if aliases & existing_aliases:
+                merged = ImageRef(
+                    path=ref.path or existing.path,
+                    url=ref.url or existing.url,
+                    mime_type=ref.mime_type or existing.mime_type,
+                    resource_id=ref.resource_id or existing.resource_id,
+                    media_handle=ref.media_handle or existing.media_handle,
+                    label=ref.label or existing.label,
+                    width=ref.width or existing.width,
+                    height=ref.height or existing.height,
+                )
+                del found[existing_key]
+                found[merged.identity] = merged
+                return
+
+        found[ref.identity] = ref
+
+    def walk(node: Any, *, image_context: bool = False) -> None:
+        if isinstance(node, dict):
+            kind = node.get("kind") or node.get("type")
+            current_image_context = image_context or kind == "image"
+
+            mime = (
+                node.get("mime_type")
+                or node.get("mimeType")
+                or node.get("mime")
+                or node.get("content_type")
+                or node.get("contentType")
+            )
+            path = node.get("path")
+            url = node.get("url")
+            variants = node.get("variants")
+            original = variants.get("original") if isinstance(variants, dict) else None
+            resource_id = node.get("resource_id") or node.get("resourceId")
+            media_handle = node.get("media_handle") or node.get("mediaHandle")
+            label = node.get("label") or node.get("filename") or node.get("name")
+            width = node.get("width")
+            height = node.get("height")
+
+            imageish = (
+                current_image_context
+                or _is_image_mime(mime)
+                or _looks_image_path(path)
+                or _looks_image_path(url)
+                or _looks_image_path(original)
+            )
+
+            if imageish:
+                add(
+                    ImageRef(
+                        path=path if isinstance(path, str) else None,
+                        url=(
+                            original
+                            if isinstance(original, str)
+                            else url if isinstance(url, str) else None
+                        ),
+                        mime_type=mime if isinstance(mime, str) else None,
+                        resource_id=resource_id if isinstance(resource_id, str) else None,
+                        media_handle=media_handle if isinstance(media_handle, str) else None,
+                        label=label if isinstance(label, str) else None,
+                        width=width if isinstance(width, int) and width >= 0 else None,
+                        height=height if isinstance(height, int) and height >= 0 else None,
+                    )
+                )
+
+            # The canonical image presentation is:
+            # {kind:"image", data:{images:[...]}}
+            for key, item in node.items():
+                child_context = current_image_context and key in {"data", "images", "media"}
+                walk(item, image_context=child_context)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, image_context=image_context)
+        elif isinstance(node, str):
+            stripped = node.strip()
+            if stripped.startswith(("{", "[")):
+                try:
+                    walk(json.loads(stripped), image_context=image_context)
+                    return
+                except (ValueError, TypeError):
+                    pass
+            if image_context and _looks_image_path(node):
+                if node.startswith(("http://", "https://")):
+                    add(ImageRef(url=node))
+                else:
+                    add(ImageRef(path=node))
 
     walk(value)
     return list(found.values())
