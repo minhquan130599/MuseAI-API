@@ -90,8 +90,8 @@ The stdio transport is recommended for local agent integrations.
 | `muse_model` | Read the active Muse model |
 | `muse_send_text` | Send text to Muse and receive the assistant response |
 | `muse_history` | Read chat history, optionally by session |
-| `muse_generate_image` | Generate image(s) from a text prompt |
-| `muse_generate_video` | Generate video from text and optional local reference images |
+| `muse_generate_image` | Generate image(s) from text and optional ChatGPT/local reference images |
+| `muse_generate_video` | Generate video from text and optional ChatGPT/local reference images |
 | `muse_job_status` | Poll an asynchronous image/video generation job |
 | `muse_list_jobs` | List image/video jobs created by the MCP process |
 | `muse_cancel_job` | Cancel a running asynchronous image/video job |
@@ -128,6 +128,51 @@ To continue the same Muse conversation, pass the returned `session_id` into the 
 
 By default the MCP response does not include raw Muse stream/history payloads. Set `include_raw=true` only when debugging protocol behavior.
 
+### Forward ChatGPT uploads to Muse
+
+Both `muse_generate_video` and `muse_generate_image` expose an `images`
+parameter as a native ChatGPT file input using:
+
+```json
+{
+  "_meta": {
+    "openai/fileParams": ["images"]
+  }
+}
+```
+
+At runtime ChatGPT can pass uploaded/reference images as:
+
+```json
+{
+  "prompt": "Create a 10-second vertical 9:16 product video using these references.",
+  "images": [
+    {
+      "download_url": "https://...",
+      "file_id": "file_...",
+      "mime_type": "image/jpeg",
+      "file_name": "reference-01.jpg"
+    }
+  ]
+}
+```
+
+The MCP server downloads those temporary URLs into:
+
+```text
+.muse-mcp/uploads/<request-id>/
+```
+
+then passes the local files to Muse as normal image attachments. Temporary
+imported files are deleted after the blocking generation finishes, or after the
+background job finishes/cancels.
+
+The old `image_paths` input remains available for local agents that already
+have filesystem access.
+
+After changing tool metadata, refresh/reconnect the ChatGPT plugin connection
+and start a new chat so ChatGPT loads the updated tool schema.
+
 ### Image mode
 
 Muse exposes generated images as presentation kind `image` with `data.images[]` media records. The MCP bridge waits for those image presentations and downloads the media through the same Hatch media path used by the web client.
@@ -155,7 +200,7 @@ Asynchronous mode:
 
 The async call returns a `job_id`. Poll the same generic `muse_job_status` tool until the job is `completed` or `failed`.
 
-Downloaded image results are returned with metadata such as `path`, `mime_type`, `media_handle`, `width`, `height`, and local downloaded paths.
+Downloaded image results expose safe presentation metadata plus public tunnel `url` / `download_url` fields when `--public-base-url` is configured. Muse/Hatch internal media URLs are not returned to remote MCP clients.
 
 CLI smoke test:
 
