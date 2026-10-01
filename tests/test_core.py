@@ -7,7 +7,7 @@ from PIL import Image
 
 from muse_ai.attachments import build_image_item, build_items
 from muse_ai.filesystem import normalize_gateway_path
-from muse_ai.media import extract_session_ids, extract_video_refs
+from muse_ai.media import extract_image_refs, extract_session_ids, extract_video_refs
 from muse_ai.noise import CipherState, NoiseXXInitiator, PROTOCOL, SymmetricState, hkdf_noise, nonce12
 from muse_ai.wire import NoiseChunk, NoiseReassembler, split_noise_payload
 
@@ -80,6 +80,42 @@ def test_media_extraction_prefers_stable_path():
     assert refs[0].identity == "workspace/user/files/result.mp4"
     assert refs[0].media_handle == "media-handle-1"
     assert extract_session_ids(data) == ["session-1"]
+
+
+def test_extract_generated_image_presentation():
+    data = {
+        "session_id": "session-image-1",
+        "presentations": [
+            {
+                "kind": "image",
+                "presentationId": "presentation-1",
+                "data": {
+                    "images": [
+                        {
+                            "path": "sandbox://workspace/user/files/generated.png",
+                            "label": "generated.png",
+                            "mime": "image/png",
+                            "media_handle": "image-handle-1",
+                            "width": 1024,
+                            "height": 1024,
+                            "variants": {
+                                "original": "/api/idea-cards/media/image-handle-1"
+                            },
+                        }
+                    ]
+                },
+            }
+        ],
+    }
+    refs = extract_image_refs(data)
+    assert len(refs) == 1
+    assert refs[0].path == "sandbox://workspace/user/files/generated.png"
+    assert refs[0].media_handle == "image-handle-1"
+    assert refs[0].mime_type == "image/png"
+    assert refs[0].label == "generated.png"
+    assert refs[0].width == 1024
+    assert refs[0].height == 1024
+    assert refs[0].url == "/api/idea-cards/media/image-handle-1"
 
 
 def test_build_inline_image_item(tmp_path: Path):
