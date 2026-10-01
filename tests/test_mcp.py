@@ -7,6 +7,7 @@ import pytest
 from muse_ai.client import ImageGenerationResult, TextResult
 from muse_ai.media import ImageRef
 from muse_ai.mcp_server import (
+    MuseMCPBridge,
     VideoJob,
     build_server,
     serialize_image_generation_result,
@@ -125,3 +126,31 @@ async def test_mcp_server_registers_expected_tools(tmp_path):
 
     bridge = server._muse_bridge
     await bridge.close()
+
+
+def test_public_media_registration(tmp_path):
+    media = tmp_path / "video.mp4"
+    media.write_bytes(b"fake-mp4")
+    bridge = MuseMCPBridge(
+        output_dir=tmp_path / "output",
+        public_base_url="https://example.trycloudflare.com",
+    )
+    payload = bridge._expose_downloaded_files({"ok": True}, [media])
+    assert payload["public_urls"][0].startswith(
+        "https://example.trycloudflare.com/media/"
+    )
+    assert payload["download_urls"][0].endswith("?download=1")
+    media_id = payload["public_urls"][0].rsplit("/", 1)[-1]
+    assert bridge.media_path(media_id) == media.resolve()
+
+
+def test_public_base_url_auto_allows_tunnel_host(tmp_path):
+    server = build_server(
+        state_dir=tmp_path / "state",
+        output_dir=tmp_path / "output",
+        public_base_url="https://example.trycloudflare.com",
+    )
+    security = server.settings.transport_security
+    assert security is not None
+    assert "example.trycloudflare.com" in security.allowed_hosts
+    assert "https://example.trycloudflare.com" in security.allowed_origins
