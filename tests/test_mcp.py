@@ -4,12 +4,13 @@ import asyncio
 
 import pytest
 
-from muse_ai.client import ImageGenerationResult, TextResult
-from muse_ai.media import ImageRef
+from muse_ai.client import GenerationResult, ImageGenerationResult, TextResult
+from muse_ai.media import ImageRef, VideoRef
 from muse_ai.mcp_server import (
     MuseMCPBridge,
     VideoJob,
     build_server,
+    serialize_generation_result,
     serialize_image_generation_result,
     serialize_text_result,
 )
@@ -66,13 +67,14 @@ def test_serialize_text_result_hides_raw_by_default():
     }
 
 
-def test_serialize_image_generation_result(tmp_path):
+def test_serialize_image_generation_result_hides_internal_media(tmp_path):
     image_path = tmp_path / "generated.png"
     result = ImageGenerationResult(
         session_id="session-image",
         images=[
             ImageRef(
                 path="sandbox://workspace/user/files/generated.png",
+                url="https://vm.metaaivm.com/media/raw/generated.png",
                 mime_type="image/png",
                 media_handle="image-handle",
                 width=1024,
@@ -83,9 +85,35 @@ def test_serialize_image_generation_result(tmp_path):
     )
     payload = serialize_image_generation_result(result)
     assert payload["session_id"] == "session-image"
-    assert payload["images"][0]["media_handle"] == "image-handle"
     assert payload["images"][0]["width"] == 1024
-    assert payload["downloaded"] == [str(image_path.resolve())]
+    assert payload["images"][0]["url"] is None
+    assert payload["images"][0]["download_url"] is None
+    assert payload["download_count"] == 1
+    assert "metaaivm.com" not in repr(payload)
+    assert "image-handle" not in repr(payload)
+
+
+def test_serialize_video_generation_hides_internal_media(tmp_path):
+    video_path = tmp_path / "generated.mp4"
+    result = GenerationResult(
+        session_id="session-video",
+        videos=[
+            VideoRef(
+                path="sandbox://workspace/imagine_media/generated.mp4",
+                url="https://vm.metaaivm.com/media/raw/generated.mp4",
+                mime_type="video/mp4",
+                media_handle="video-handle",
+            )
+        ],
+        downloaded=[video_path],
+    )
+    payload = serialize_generation_result(result)
+    assert payload["session_id"] == "session-video"
+    assert payload["videos"][0]["url"] is None
+    assert payload["videos"][0]["download_url"] is None
+    assert payload["download_count"] == 1
+    assert "metaaivm.com" not in repr(payload)
+    assert "video-handle" not in repr(payload)
 
 
 def test_video_job_public_does_not_serialize_asyncio_task():
@@ -128,18 +156,36 @@ async def test_mcp_server_registers_expected_tools(tmp_path):
     await bridge.close()
 
 
-def test_public_media_registration(tmp_path):
+def test_public_media_registration_rewrites_video_url(tmp_path):
     media = tmp_path / "video.mp4"
     media.write_bytes(b"fake-mp4")
     bridge = MuseMCPBridge(
         output_dir=tmp_path / "output",
         public_base_url="https://example.trycloudflare.com",
     )
-    payload = bridge._expose_downloaded_files({"ok": True}, [media])
+    payload = bridge._expose_downloaded_files(
+        {
+            "ok": True,
+            "videos": [
+                {
+                    "mime_type": "video/mp4",
+                    "url": None,
+                    "download_url": None,
+                }
+            ],
+        },
+        [media],
+    )
     assert payload["public_urls"][0].startswith(
         "https://example.trycloudflare.com/media/"
     )
     assert payload["download_urls"][0].endswith("?download=1")
+    assert payload["videos"][0]["url"] == payload["public_urls"][0]
+    assert (
+        payload["videos"][0]["download_url"]
+        == payload["download_urls"][0]
+    )
+    assert "local_path" not in payload["files"][0]
     media_id = payload["public_urls"][0].rsplit("/", 1)[-1]
     assert bridge.media_path(media_id) == media.resolve()
 
