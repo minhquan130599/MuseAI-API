@@ -256,19 +256,62 @@ For a long-running local MCP service:
 muse-mcp --transport streamable-http --host 127.0.0.1 --port 8765
 ```
 
-or:
-
-```bat
-run_mcp_http.bat
-```
-
 Endpoint:
 
 ```text
 http://127.0.0.1:8765/mcp
 ```
 
-The server binds to loopback by default. Do not expose the MCP HTTP endpoint publicly without adding authentication, network controls, and access restrictions because MCP tools can use your authenticated Muse account and optional local image paths.
+When exposing the server through a tunnel, pass its public origin with
+`--public-base-url`. The public hostname is automatically added to the
+MCP DNS-rebinding allowlist, and generated image/video files receive public
+view/download URLs.
+
+Example with Cloudflare Quick Tunnel:
+
+```bat
+muse-mcp ^
+  --transport streamable-http ^
+  --host 127.0.0.1 ^
+  --port 8765 ^
+  --public-base-url https://example.trycloudflare.com
+```
+
+Then expose the local server:
+
+```bat
+cloudflared tunnel --url http://127.0.0.1:8765
+```
+
+The MCP endpoint is:
+
+```text
+https://example.trycloudflare.com/mcp
+```
+
+Generated media responses include entries similar to:
+
+```json
+{
+  "files": [
+    {
+      "filename": "video.mp4",
+      "public_url": "https://example.trycloudflare.com/media/<opaque-id>",
+      "download_url": "https://example.trycloudflare.com/media/<opaque-id>?download=1"
+    }
+  ]
+}
+```
+
+The media route uses an opaque per-process identifier rather than exposing the
+local filesystem path. Quick Tunnel hostnames change when the tunnel is
+restarted, so restart `muse-mcp` with the new `--public-base-url` when that
+happens.
+
+The server binds to loopback by default. Do not expose the MCP HTTP endpoint
+publicly without adding authentication, network controls, and access
+restrictions because MCP tools can use your authenticated Muse account and
+optional local image paths.
 
 ## Web UI
 
