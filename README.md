@@ -91,7 +91,8 @@ The stdio transport is recommended for local agent integrations.
 | `muse_send_text` | Send text to Muse and receive the assistant response |
 | `muse_history` | Read chat history, optionally by session |
 | `muse_generate_image` | Generate image(s) from text and optional ChatGPT/local reference images |
-| `muse_generate_video` | Generate video from text and optional ChatGPT/local reference images |
+| `muse_generate_video` | Generate video from text; also supports optional file/local references |
+| `muse_generate_video_from_images` | Preferred video tool when ChatGPT images are attached; `images` is required |
 | `muse_job_status` | Poll an asynchronous image/video generation job |
 | `muse_list_jobs` | List image/video jobs created by the MCP process |
 | `muse_cancel_job` | Cancel a running asynchronous image/video job |
@@ -168,7 +169,15 @@ imported files are deleted after the blocking generation finishes, or after the
 background job finishes/cancels.
 
 The old `image_paths` input remains available for local agents that already
-have filesystem access.
+have filesystem access. When a ChatGPT request explicitly refers to attached
+images, prefer `muse_generate_video_from_images`; its `images` field is required,
+which prevents the model from silently falling back to text-only generation.
+
+When `--public-base-url` is configured, the MCP bridge forces generated media
+downloads even if a caller passes `download=false`, because public `/media/...`
+links can only be created from locally downloaded output files. Muse/Hatch
+`metaaivm.com/media/...` URLs are scrubbed from text/history responses so remote
+clients do not surface session-bound dead links.
 
 After changing tool metadata, refresh/reconnect the ChatGPT plugin connection
 and start a new chat so ChatGPT loads the updated tool schema.
