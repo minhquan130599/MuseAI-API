@@ -9,9 +9,12 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
+from starlette.requests import Request
+from starlette.responses import FileResponse, PlainTextResponse, Response
 
 from .auth import MuseAuth
 from .client import GenerationResult, ImageGenerationResult, MuseClient, TextResult
@@ -123,15 +126,20 @@ class MuseMCPBridge:
         *,
         state_dir: str | Path = DEFAULT_STATE_DIR,
         output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+        public_base_url: str | None = None,
     ) -> None:
         self.state_dir = Path(state_dir)
         self.output_dir = Path(output_dir)
+        self.public_base_url = (
+            public_base_url.rstrip("/") if public_base_url else None
+        )
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self._text_client: MuseClient | None = None
         self._text_connect_lock = asyncio.Lock()
         self._text_call_lock = asyncio.Lock()
         self._jobs_lock = asyncio.Lock()
         self.jobs: dict[str, VideoJob] = {}
+        self._media_files: dict[str, Path] = {}
 
     async def _new_client(self) -> MuseClient:
         auth = MuseAuth(state_dir=self.state_dir)
@@ -263,6 +271,68 @@ class MuseMCPBridge:
             images.append(path)
         return images
 
+    def _expose_downloaded_files(
+        self,
+        payload: dict[str, Any],
+        paths: list[Path],
+    ) -> dict[str, Any]:
+        files: list[dict[str, Any]] = []
+        for raw_path in paths:
+            path = Path(raw_path).resolve()
+            if not path.is_file():
+                continue
+
+            token = uuid.uuid4().hex
+            self._media_files[token] = path
+            route = f"/media/{token}"
+            public_url = (
+                f"{self.public_base_url}{route}"
+                if self.public_base_url
+                else None
+            )
+            files.append(
+                {
+                    "filename": path.name,
+                    "mime_hint": (
+                        "video/mp4"
+                        if path.suffix.lower() == ".mp4"
+                        else None
+                    ),
+                    "local_path": str(path),
+                    "public_url": public_url,
+                    "download_url": (
+                        f"{public_url}?download=1"
+                        if public_url
+                        else None
+                    ),
+                }
+            )
+
+        payload["files"] = files
+        payload["public_urls"] = [
+            item["public_url"]
+            for item in files
+            if item["public_url"]
+        ]
+        payload["download_urls"] = [
+            item["download_url"]
+            for item in files
+            if item["download_url"]
+        ]
+        if files and not self.public_base_url:
+            payload["public_media_warning"] = (
+                "Generated files are local only. Start muse-mcp with "
+                "--public-base-url https://<your-tunnel-host> so remote MCP "
+                "clients receive downloadable HTTPS links."
+            )
+        return payload
+
+    def media_path(self, token: str) -> Path | None:
+        path = self._media_files.get(token)
+        if path is None or not path.is_file():
+            return None
+        return path
+
     async def generate_video_wait(
         self,
         *,
@@ -285,7 +355,10 @@ class MuseMCPBridge:
                 min_videos=min_videos,
                 download=download,
             )
-            return serialize_generation_result(result)
+            return self._expose_downloaded_files(
+                serialize_generation_result(result),
+                result.downloaded,
+            )
         finally:
             await client.close()
 
@@ -358,7 +431,10 @@ class MuseMCPBridge:
                 download=download,
             )
             job.session_id = result.session_id
-            job.result = serialize_generation_result(result)
+            job.result = self._expose_downloaded_files(
+                serialize_generation_result(result),
+                result.downloaded,
+            )
             job.status = "completed"
         except asyncio.CancelledError:
             job.status = "cancelled"
@@ -392,7 +468,10 @@ class MuseMCPBridge:
                 min_images=min_images,
                 download=download,
             )
-            return serialize_image_generation_result(result)
+            return self._expose_downloaded_files(
+                serialize_image_generation_result(result),
+                result.downloaded,
+            )
         finally:
             await client.close()
 
@@ -461,7 +540,10 @@ class MuseMCPBridge:
                 download=download,
             )
             job.session_id = result.session_id
-            job.result = serialize_image_generation_result(result)
+            job.result = self._expose_downloaded_files(
+                serialize_image_generation_result(result),
+                result.downloaded,
+            )
             job.status = "completed"
         except asyncio.CancelledError:
             job.status = "cancelled"
@@ -534,12 +616,14 @@ def build_server(
     port: int = 8765,
     state_dir: str | Path = DEFAULT_STATE_DIR,
     output_dir: str | Path = DEFAULT_OUTPUT_DIR,
+    public_base_url: str | None = None,
     allowed_hosts: list[str] | None = None,
     allowed_origins: list[str] | None = None,
 ) -> FastMCP:
     bridge = MuseMCPBridge(
         state_dir=state_dir,
         output_dir=output_dir,
+        public_base_url=public_base_url,
     )
 
     @asynccontextmanager
@@ -549,19 +633,34 @@ def build_server(
         finally:
             await bridge.close()
 
+    extra_hosts = list(allowed_hosts or [])
+    extra_origins = list(allowed_origins or [])
+    if public_base_url:
+        parsed = urlparse(public_base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError(
+                "public_base_url must be an absolute http(s) URL, for example "
+                "https://example.trycloudflare.com"
+            )
+        if parsed.netloc not in extra_hosts:
+            extra_hosts.append(parsed.netloc)
+        origin = f"{parsed.scheme}://{parsed.netloc}"
+        if origin not in extra_origins:
+            extra_origins.append(origin)
+
     transport_security = TransportSecuritySettings(
         enable_dns_rebinding_protection=True,
         allowed_hosts=[
             "127.0.0.1:*",
             "localhost:*",
             "[::1]:*",
-            *(allowed_hosts or []),
+            *extra_hosts,
         ],
         allowed_origins=[
             "http://127.0.0.1:*",
             "http://localhost:*",
             "http://[::1]:*",
-            *(allowed_origins or []),
+            *extra_origins,
         ],
     )
 
@@ -581,6 +680,28 @@ def build_server(
         transport_security=transport_security,
         lifespan=lifespan,
     )
+
+    @server.custom_route(
+        "/media/{media_id}",
+        methods=["GET"],
+        include_in_schema=False,
+    )
+    async def serve_generated_media(request: Request) -> Response:
+        media_id = request.path_params.get("media_id", "")
+        path = bridge.media_path(media_id)
+        if path is None:
+            return PlainTextResponse("media not found", status_code=404)
+
+        download = request.query_params.get("download", "").lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        return FileResponse(
+            path,
+            filename=path.name,
+            content_disposition_type="attachment" if download else "inline",
+        )
 
     @server.tool(
         description=(
@@ -774,6 +895,15 @@ def main() -> None:
         default=int(os.environ.get("MUSE_MCP_PORT", "8765")),
     )
     parser.add_argument(
+        "--public-base-url",
+        default=os.environ.get("MUSE_MCP_PUBLIC_BASE_URL"),
+        help=(
+            "Public HTTP(S) origin used to build generated media links, e.g. "
+            "https://example.trycloudflare.com. Its host is automatically "
+            "added to the MCP Host allowlist."
+        ),
+    )
+    parser.add_argument(
         "--allowed-host",
         action="append",
         default=[
@@ -818,6 +948,7 @@ def main() -> None:
         port=args.port,
         state_dir=args.state_dir,
         output_dir=args.output_dir,
+        public_base_url=args.public_base_url,
         allowed_hosts=args.allowed_host,
         allowed_origins=args.allowed_origin,
     )
