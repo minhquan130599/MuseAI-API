@@ -4,8 +4,14 @@ import asyncio
 
 import pytest
 
-from muse_ai.client import TextResult
-from muse_ai.mcp_server import VideoJob, build_server, serialize_text_result
+from muse_ai.client import ImageGenerationResult, TextResult
+from muse_ai.media import ImageRef
+from muse_ai.mcp_server import (
+    VideoJob,
+    build_server,
+    serialize_image_generation_result,
+    serialize_text_result,
+)
 from muse_ai.text import (
     coalesce_text_fragments,
     extract_assistant_texts,
@@ -59,6 +65,28 @@ def test_serialize_text_result_hides_raw_by_default():
     }
 
 
+def test_serialize_image_generation_result(tmp_path):
+    image_path = tmp_path / "generated.png"
+    result = ImageGenerationResult(
+        session_id="session-image",
+        images=[
+            ImageRef(
+                path="sandbox://workspace/user/files/generated.png",
+                mime_type="image/png",
+                media_handle="image-handle",
+                width=1024,
+                height=1024,
+            )
+        ],
+        downloaded=[image_path],
+    )
+    payload = serialize_image_generation_result(result)
+    assert payload["session_id"] == "session-image"
+    assert payload["images"][0]["media_handle"] == "image-handle"
+    assert payload["images"][0]["width"] == 1024
+    assert payload["downloaded"] == [str(image_path.resolve())]
+
+
 def test_video_job_public_does_not_serialize_asyncio_task():
     async def sleeper():
         await asyncio.sleep(0)
@@ -68,6 +96,7 @@ def test_video_job_public_does_not_serialize_asyncio_task():
         job = VideoJob(id="job-1", prompt="create video", task=task)
         data = job.public()
         assert "task" not in data
+        assert data["kind"] == "video"
         await task
 
     asyncio.run(scenario())
@@ -87,6 +116,7 @@ async def test_mcp_server_registers_expected_tools(tmp_path):
         "muse_model",
         "muse_send_text",
         "muse_history",
+        "muse_generate_image",
         "muse_generate_video",
         "muse_job_status",
         "muse_list_jobs",
