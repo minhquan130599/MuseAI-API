@@ -625,6 +625,7 @@ class MuseClient:
         self,
         *,
         prompt: str,
+        images: list[str | Path] | None = None,
         output_dir: str | Path = "outputs",
         session_id: str | None = None,
         timeout: float = 300.0,
@@ -662,7 +663,7 @@ class MuseClient:
 
         events = await self.chat_stream(
             prompt=prompt,
-            images=[],
+            images=list(images or []),
             session_id=session_id,
         )
         resolved_session = await self._resolve_session_id(
