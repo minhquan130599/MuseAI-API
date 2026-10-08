@@ -41,6 +41,9 @@ class FakeElement {
   }
   setAttribute() {}
   querySelector() { return new FakeElement("span"); }
+  querySelectorAll() { return []; }
+  replaceWith() {}
+  remove() {}
   focus() {}
   get innerHTML() { return this._html || ""; }
   set innerHTML(text) { this._html = text; this.children = []; }
