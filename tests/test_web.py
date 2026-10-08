@@ -1,6 +1,6 @@
 from fastapi.testclient import TestClient
 
-from muse_ai.web.app import JobRecord, app, safe_filename
+from muse_ai.web.app import JobRecord, app, safe_filename, service
 
 
 def test_safe_filename_blocks_parent_components():
@@ -35,3 +35,66 @@ def test_web_index_is_served():
         response = client.get("/")
         assert response.status_code == 200
         assert "MuseAI Studio" in response.text
+        assert "Chat thường" in response.text
+        assert 'src="/chat.js"' in response.text
+        assert 'href="/chat.css"' in response.text
+
+
+def test_chat_static_assets_are_served():
+    with TestClient(app) as client:
+        js = client.get("/chat.js")
+        css = client.get("/chat.css")
+
+    assert js.status_code == 200
+    assert 'fetch("/api/chat/send"' in js.text
+    assert css.status_code == 200
+    assert ".chat-bubble" in css.text
+
+
+def test_chat_send_rejects_empty_message():
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat/send",
+            json={"message": "   "},
+        )
+        assert response.status_code == 400
+        assert response.json()["detail"] == "Message is required"
+
+
+def test_chat_send_uses_session_id(monkeypatch):
+    async def fake_auth_status():
+        return {"authenticated": True, "outcome": "validated"}
+
+    async def fake_send_chat_message(*, message, session_id, timeout):
+        assert message == "Xin chào Muse"
+        assert session_id == "session-existing"
+        assert timeout == 45
+        return {
+            "ok": True,
+            "session_id": "session-existing",
+            "text": "Xin chào!",
+        }
+
+    monkeypatch.setattr(service, "auth_status", fake_auth_status)
+    monkeypatch.setattr(
+        service,
+        "send_chat_message",
+        fake_send_chat_message,
+    )
+
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat/send",
+            json={
+                "message": "Xin chào Muse",
+                "session_id": "session-existing",
+                "timeout": 45,
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "ok": True,
+        "session_id": "session-existing",
+        "text": "Xin chào!",
+    }
