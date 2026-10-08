@@ -10,7 +10,7 @@ from muse_ai.client import MuseClient
 
 from muse_ai.attachments import build_image_item, build_items
 from muse_ai.filesystem import normalize_gateway_path
-from muse_ai.media import extract_image_refs, extract_session_ids, extract_video_refs
+from muse_ai.media import VideoRef, extract_image_refs, extract_session_ids, extract_video_refs
 from muse_ai.noise import CipherState, NoiseXXInitiator, PROTOCOL, SymmetricState, hkdf_noise, nonce12
 from muse_ai.wire import NoiseChunk, NoiseReassembler, split_noise_payload
 
@@ -62,6 +62,54 @@ def test_gateway_path_normalization():
     assert normalize_gateway_path(r"C:\Users\alice\workspace\user\files\a.mp4") == "workspace/user/files/a.mp4"
     assert normalize_gateway_path("/home/alice/workspace/user/files/a.mp4") == "workspace/user/files/a.mp4"
     assert normalize_gateway_path("file:///workspace/user/files/a.mp4?x=1") == "workspace/user/files/a.mp4"
+
+
+@pytest.mark.asyncio
+async def test_video_download_404_retries_and_preserves_success(tmp_path, monkeypatch):
+    from muse_ai.client import MuseClient
+    client = MuseClient(auth=None, state_dir=tmp_path)
+    refs = [
+        VideoRef(path="workspace/imagine_media/one.mp4"),
+        VideoRef(path="workspace/imagine_media/two.mp4"),
+    ]
+    calls: dict[str, int] = {}
+
+    async def fake_sessions_list():
+        return {"result": {"sessions": []}}
+
+    async def fake_history(*, session_id=None, limit=80, **kwargs):
+        return {"messages": []}
+
+    async def fake_stream(**kwargs):
+        return [{"session_id": "s-video"}]
+
+    async def fake_wait(**kwargs):
+        return refs, {"messages": []}
+
+    async def fake_download(ref, destination):
+        calls[ref.identity] = calls.get(ref.identity, 0) + 1
+        if ref.identity.endswith("two.mp4") and calls[ref.identity] == 1:
+            raise RuntimeError("Hatch RPC returned HTTP 404: not_found")
+        path = Path(destination)
+        path.write_bytes(b"mp4-example")
+        return path
+
+    async def instant_sleep(*args):
+        return None
+
+    monkeypatch.setattr(client, "sessions_list", fake_sessions_list)
+    monkeypatch.setattr(client, "history", fake_history)
+    monkeypatch.setattr(client, "chat_stream", fake_stream)
+    monkeypatch.setattr(client, "wait_for_videos", fake_wait)
+    monkeypatch.setattr(client, "download_video", fake_download)
+    monkeypatch.setattr("muse_ai.client.asyncio.sleep", instant_sleep)
+    result = await client.generate_video(
+        prompt="Generate 2 videos", output_dir=tmp_path / "output"
+    )
+    assert len(result.downloaded) == 2
+    assert result.download_errors == []
+    assert calls[refs[0].identity] == 1
+    assert calls[refs[1].identity] == 2
 
 
 def test_media_extraction_prefers_stable_path():
