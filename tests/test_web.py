@@ -36,6 +36,11 @@ def test_web_index_is_served():
         assert response.status_code == 200
         assert "MuseAI Studio" in response.text
         assert "Chat thường" in response.text
+        assert "/chat.js" in response.text
+        assert "/chat.css" in response.text
+
+        assert client.get("/chat.js").status_code == 200
+        assert client.get("/chat.css").status_code == 200
         assert 'src="/chat.js"' in response.text
         assert 'href="/chat.css"' in response.text
 
