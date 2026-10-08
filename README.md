@@ -395,7 +395,17 @@ Open:
 http://127.0.0.1:8787
 ```
 
-The UI supports Muse OTP login, normal multi-turn text chat with session reuse, text-to-video, optional reference images, background generation jobs, live status polling, in-browser video playback, and MP4 downloads. Use **Chat thường** to send ordinary messages (Enter to send, Shift+Enter for a new line). The UI keeps recent conversations and their Muse `session_id` in the browser's local storage, so you can switch threads after refreshing. Choose **+ Chat mới** to start a separate Muse conversation. Clearing site data also clears this local conversation history.
+The web UI supports **a pool of multiple Muse accounts** with separate login/session state, OTP management, normal chat with account selection, and batch video generation across distinct ready accounts. Click the top-right account status to manage the account list. Paste **up to 10 email addresses** separated by commas/newlines and send OTP requests together; enter each OTP by selecting its account in the popup. You can verify, enable/disable, and remove accounts. A previous single-account session in `.muse-state/` is imported as a separate legacy entry on first launch if no account pool exists.
+
+Each account has its own cookie/device session under `.muse-web/accounts/<id>/`. The accounts index stores only metadata, not authentication tokens. The account list shows which sessions are ready and which are currently running tasks.
+
+In **Chat thường**, select an account before sending messages. The browser saves `accountId` with every conversation, so its Muse `session_id` is never automatically reused on a different account. Switching accounts starts a fresh chat.
+
+In **Tạo video**, set **Số task / số tài khoản** to N (1–20). A single submit creates N independent jobs with the same prompt/reference images; the scheduler randomly selects **N different, enabled, verified and currently idle accounts** from the pool and reserves each account until its task finishes or is cancelled. If fewer than N accounts are available, it returns HTTP 409 rather than silently reusing an account. Batch results include `batch_id`, `account_id`, `account_label` and per-job status/download URLs. The default web concurrency is 20; adjust with `MUSE_WEB_CONCURRENCY` if required. This does not bypass Muse's account quotas, subscriptions, or usage restrictions.
+
+**Important:** The web app is designed for trusted local access. Do not expose this multi-account control panel to the public Internet without implementing administrator authentication and access controls.
+
+Use **Chat thường** to send ordinary messages (Enter to send, Shift+Enter for a new line). Muse text replies appear immediately. Generated image/video attachments and supported file references are checked asynchronously from Muse chat history, downloaded to `.muse-web/chat-media/`, and previewed/linked for download in the same chat bubble when ready. File monitoring can continue after an initial response such as "Xong"; only successfully downloaded local files produce browser links. The UI keeps recent conversations and their Muse `session_id` in the browser's local storage, so you can switch threads after refreshing. Choose **+ Chat mới** to start a separate Muse conversation. Clearing site data also clears this local conversation history.
 
 REST API documentation is available at:
 
