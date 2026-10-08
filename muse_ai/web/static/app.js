@@ -5,6 +5,13 @@ const sendOtp = byId("sendOtp");
 const confirmOtp = byId("confirmOtp");
 const otpArea = byId("otpArea");
 const authMessage = byId("authMessage");
+const authDialog = byId("authDialog");
+
+authPill.addEventListener("click", () => authDialog.showModal());
+byId("closeAuth").addEventListener("click", () => authDialog.close());
+authDialog.addEventListener("click", (event) => {
+  if (event.target === authDialog) authDialog.close();
+});
 const promptEl = byId("prompt");
 const imagesEl = byId("images");
 const dropzone = byId("dropzone");
@@ -54,39 +61,58 @@ function setMessage(el, text, type = "") {
 async function refreshAuth() {
   try {
     const state = await api("/api/auth/status");
-    authPill.className = "pill " + (state.authenticated ? "ok" : "bad");
+    authPill.className = "pill auth-trigger " + (state.authenticated ? "ok" : "bad");
     authPill.querySelector("span:last-child").textContent =
-      state.authenticated ? "Đã đăng nhập" : "Chưa đăng nhập";
+      state.authenticated
+        ? (state.ready_accounts || 0) + " TK sẵn sàng"
+        : "Quản lý tài khoản";
+    byId("authDialogStatus").textContent =
+      (state.ready_accounts || 0) + " tài khoản sẵn sàng";
     generateBtn.disabled = !state.authenticated;
     sendChatBtn.disabled = !state.authenticated;
-    if (state.authenticated) {
-      otpArea.classList.add("hidden");
-    }
   } catch {
-    authPill.className = "pill bad";
+    authPill.className = "pill auth-trigger bad";
     authPill.querySelector("span:last-child").textContent = "Mất kết nối";
+    byId("authDialogStatus").textContent = "Không thể kiểm tra trạng thái";
     generateBtn.disabled = true;
     sendChatBtn.disabled = true;
   }
 }
 
 sendOtp.addEventListener("click", async () => {
-  const email = byId("email").value.trim();
-  if (!email) {
-    setMessage(authMessage, "Nhập email Muse trước.", "error");
+  const emails = [...new Set(byId("email").value
+    .split(/[\s,;]+/)
+    .map(value => value.trim())
+    .filter(Boolean))];
+  if (!emails.length || emails.length > 10 ||
+      emails.some(value => !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(value))) {
+    setMessage(authMessage, "Nhập 1–10 email hợp lệ, cách nhau bằng dấu phẩy hoặc xuống dòng.", "error");
     return;
   }
   sendOtp.disabled = true;
-  setMessage(authMessage, "Đang khởi tạo phiên đăng nhập...");
+  setMessage(authMessage, "Đang gửi OTP cho " + emails.length + " tài khoản...");
   try {
-    await api("/api/auth/start", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ email: email, region: "VN" })
-    });
-    otpArea.classList.remove("hidden");
-    byId("otp").focus();
-    setMessage(authMessage, "OTP đã được gửi. Nhập mã để xác nhận.", "success");
+    const responses = await Promise.allSettled(emails.map(email =>
+      api("/api/accounts", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({email, region: "VN"})
+      })
+    ));
+    const successes = responses.filter(result => result.status === "fulfilled");
+    const failures = responses.filter(result => result.status === "rejected");
+    await window.refreshMuseAccounts?.();
+    if (successes.length) {
+      byId("otpAccountSelect").value = successes[0].value.id;
+      otpArea.classList.remove("hidden");
+      byId("otp").focus();
+    }
+    setMessage(
+      authMessage,
+      "Đã gửi OTP: " + successes.length + "/" + emails.length + " tài khoản." +
+      (failures.length ? " Lỗi: " + failures.map(result => result.reason.message).join("; ") : ""),
+      failures.length ? "error" : "success"
+    );
   } catch (err) {
     setMessage(authMessage, err.message, "error");
   } finally {
@@ -102,12 +128,16 @@ confirmOtp.addEventListener("click", async () => {
   }
   confirmOtp.disabled = true;
   try {
-    await api("/api/auth/confirm", {
+    const id = byId("otpAccountSelect").value;
+    if (!id) throw new Error("Chọn tài khoản đang chờ OTP.");
+    await api("/api/accounts/" + encodeURIComponent(id) + "/otp", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ otp: otp })
     });
-    setMessage(authMessage, "Đăng nhập thành công.", "success");
+    byId("otp").value = "";
+    setMessage(authMessage, "Đã thêm và xác minh tài khoản Muse.", "success");
+    await window.refreshMuseAccounts?.();
     await refreshAuth();
   } catch (err) {
     setMessage(authMessage, err.message, "error");
@@ -194,21 +224,24 @@ generateBtn.addEventListener("click", async () => {
   form.append("prompt", prompt);
   form.append("timeout", byId("timeout").value);
   form.append("min_videos", byId("minVideos").value);
+  form.append("task_count", byId("taskCount").value);
   selectedFiles.forEach((file) => form.append("images", file, file.name));
 
   generateBtn.disabled = true;
   setMessage(generateMessage, "Đang gửi generation job...");
 
   try {
-    const job = await api("/api/generations", {
+    const batch = await api("/api/generations", {
       method: "POST",
       body: form
     });
     setMessage(
       generateMessage,
-      "Đã tạo job " + job.id + ". Bạn có thể để trang này chạy nền.",
+      "Đã tạo batch " + batch.batch_id + " với " + batch.count +
+      " task trên " + batch.count + " tài khoản Muse khác nhau.",
       "success"
     );
+    await window.refreshMuseAccounts?.();
     promptEl.value = "";
     promptEl.dispatchEvent(new Event("input"));
     selectedFiles = [];
@@ -287,7 +320,9 @@ function renderJobs(jobs) {
     const meta = node.querySelector(".job-meta");
     const entries = [
       String((job.images || []).length) + " ảnh",
-      "min " + job.min_videos + " video"
+      "min " + job.min_videos + " video",
+      "TK: " + (job.account_label || "chưa gán"),
+      ...(job.batch_id ? ["batch " + job.batch_id] : [])
     ];
 
     if (job.session_id) {
