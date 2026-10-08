@@ -357,12 +357,18 @@ class WebService:
                     }
                     for name in downloads
                 ]
-                status = "completed" if downloads else "completed_no_media"
-                message = (
-                    f"Hoàn tất: {len(downloads)} file đã tải về"
-                    if downloads
-                    else "Generation hoàn tất nhưng chưa tải được file media"
-                )
+                if downloads and result.download_errors:
+                    status = "completed_partial"
+                    message = (
+                        f"Đã tải {len(downloads)} video; "
+                        f"{len(result.download_errors)} mục media khác không khả dụng"
+                    )
+                elif downloads:
+                    status = "completed"
+                    message = f"Đã tải {len(downloads)} video"
+                else:
+                    status = "completed_no_media"
+                    message = "Muse đã tạo media nhưng chưa tải được video về máy"
                 await self.jobs.update(
                     job_id,
                     status=status,
