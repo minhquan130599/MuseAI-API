@@ -189,20 +189,17 @@ class MuseClient:
 
         deadline = time.monotonic() + timeout
 
+        # A new chat is a real Muse secondary thread, not the primary inbox.
+        # Omitting session_id from /chat/stream routes to the primary thread.
+        # Muse accepts a fresh UUID as session_id and registers is_thread=True.
+        target_session_id = session_id or str(uuid.uuid4())
         sessions_before: set[str] = set()
-        if session_id is None:
-            try:
-                sessions_before = set(
-                    extract_session_ids(await self.sessions_list())
-                )
-            except Exception:
-                pass
 
         baseline_history = None
         baseline_assistant: set[str] = set()
         try:
             baseline_history = await self.history(
-                session_id=session_id,
+                session_id=target_session_id,
                 limit=80,
             )
             baseline_assistant = set(
@@ -214,15 +211,17 @@ class MuseClient:
         remaining = max(1.0, deadline - time.monotonic())
         events = await self.chat_stream(
             prompt=prompt,
-            session_id=session_id,
+            session_id=target_session_id,
             stream_timeout=min(30.0, remaining),
         )
 
-        resolved_session = await self._resolve_session_id(
-            session_id,
-            events,
-            sessions_before,
-        )
+        event_sessions = extract_session_ids(events)
+        if event_sessions and target_session_id not in event_sessions:
+            raise RuntimeError(
+                "Muse responded with a different session_id than the "
+                "requested chat thread; refusing to mix conversations"
+            )
+        resolved_session = target_session_id
 
         event_fragments = [
             fragment
@@ -304,8 +303,8 @@ class MuseClient:
             new_ids = [value for value in current if value not in sessions_before]
             if new_ids:
                 return new_ids[0]
-            if current:
-                return current[0]
+            # Never claim an arbitrary existing session (often the primary
+            # conversation) as the result of a new chat request.
         except Exception:
             pass
         return None
