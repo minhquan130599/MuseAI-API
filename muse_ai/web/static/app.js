@@ -13,6 +13,7 @@ const generateBtn = byId("generate");
 const generateMessage = byId("generateMessage");
 const jobsEl = byId("jobs");
 const activeJob = byId("activeJob");
+const sendChatBtn = byId("sendChat");
 
 let selectedFiles = [];
 let pollTimer = null;
@@ -57,6 +58,7 @@ async function refreshAuth() {
     authPill.querySelector("span:last-child").textContent =
       state.authenticated ? "Đã đăng nhập" : "Chưa đăng nhập";
     generateBtn.disabled = !state.authenticated;
+    sendChatBtn.disabled = !state.authenticated;
     if (state.authenticated) {
       otpArea.classList.add("hidden");
     }
@@ -64,6 +66,7 @@ async function refreshAuth() {
     authPill.className = "pill bad";
     authPill.querySelector("span:last-child").textContent = "Mất kết nối";
     generateBtn.disabled = true;
+    sendChatBtn.disabled = true;
   }
 }
 
