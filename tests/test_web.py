@@ -43,6 +43,18 @@ def test_web_index_is_served():
         assert client.get("/chat.css").status_code == 200
         assert 'src="/chat.js"' in response.text
         assert 'href="/chat.css"' in response.text
+        assert 'href="/auth-modal.css"' in response.text
+        assert 'id="authDialog"' in response.text
+        assert 'id="authPill"' in response.text
+        assert 'class="panel auth-panel"' not in response.text
+        assert 'id="accountList"' in response.text
+        assert 'id="otpAccountSelect"' in response.text
+        assert 'id="chatAccount"' in response.text
+        assert 'id="taskCount"' in response.text
+        assert 'src="/accounts.js"' in response.text
+        assert 'href="/accounts.css"' in response.text
+        assert client.get("/accounts.js").status_code == 200
+        assert client.get("/accounts.css").status_code == 200
 
 
 def test_chat_static_assets_are_served():
@@ -70,7 +82,8 @@ def test_chat_send_uses_session_id(monkeypatch):
     async def fake_auth_status():
         return {"authenticated": True, "outcome": "validated"}
 
-    async def fake_send_chat_message(*, message, session_id, timeout):
+    async def fake_send_chat_message(*, message, session_id, timeout, account_id):
+        assert account_id is None
         assert message == "Xin chào Muse"
         assert session_id == "session-existing"
         assert timeout == 45
