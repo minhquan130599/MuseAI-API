@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 from pathlib import Path
 
+import pytest
 from PIL import Image
+
+from muse_ai.client import MuseClient
 
 from muse_ai.attachments import build_image_item, build_items
 from muse_ai.filesystem import normalize_gateway_path
@@ -132,3 +135,79 @@ def test_build_text_only_items():
     assert items == [
         {"type": "text", "text": "Create a cinematic 10-second video"}
     ]
+
+@pytest.mark.asyncio
+async def test_send_text_starts_new_secondary_thread_not_primary(tmp_path, monkeypatch):
+    client = MuseClient(auth=None, state_dir=tmp_path)
+    sent_sessions = []
+    history_sessions = []
+
+    async def fake_stream(*, prompt, session_id, stream_timeout):
+        assert session_id
+        sent_sessions.append(session_id)
+        return [{"session_id": session_id, "is_thread": True, "channel": "ack"}]
+
+    async def fake_history(*, session_id=None, limit=80, **kwargs):
+        history_sessions.append(session_id)
+        if len(history_sessions) in (1, 3):
+            return {"messages": []}
+        return {
+            "messages": [
+                {"role": "assistant", "content": "Chào bạn!"}
+            ]
+        }
+
+    async def fail_session_list():
+        raise AssertionError("No primary-session fallback is allowed")
+
+    monkeypatch.setattr(client, "chat_stream", fake_stream)
+    monkeypatch.setattr(client, "history", fake_history)
+    monkeypatch.setattr(client, "sessions_list", fail_session_list)
+
+    result = await client.send_text(prompt="xin chào", session_id=None, timeout=5)
+    assert result.text == "Chào bạn!"
+    assert result.session_id == sent_sessions[0]
+    assert history_sessions == [sent_sessions[0], sent_sessions[0]]
+
+    # An existing thread must be reused, not replaced with a fresh ID.
+    second = await client.send_text(
+        prompt="tiếp tục", session_id=result.session_id, timeout=5
+    )
+    assert second.session_id == result.session_id
+    assert sent_sessions == [result.session_id, result.session_id]
+
+
+@pytest.mark.asyncio
+async def test_send_text_rejects_wrong_thread_ack(tmp_path, monkeypatch):
+    client = MuseClient(auth=None, state_dir=tmp_path)
+
+    async def fake_stream(*, prompt, session_id, stream_timeout):
+        return [{"session_id": "existing-primary-thread", "is_primary": True}]
+
+    async def fake_history(*, session_id=None, limit=80, **kwargs):
+        return {"messages": []}
+
+    monkeypatch.setattr(client, "chat_stream", fake_stream)
+    monkeypatch.setattr(client, "history", fake_history)
+
+    with pytest.raises(RuntimeError, match="different session_id"):
+        await client.send_text(prompt="new chat", session_id=None, timeout=5)
+
+
+@pytest.mark.asyncio
+async def test_resolve_session_id_never_uses_arbitrary_existing_thread(
+    tmp_path, monkeypatch
+):
+    client = MuseClient(auth=None, state_dir=tmp_path)
+
+    async def fake_list():
+        return {"result": {"sessions": [
+            {"session_id": "primary-existing", "is_primary": True}
+        ]}}
+
+    monkeypatch.setattr(client, "sessions_list", fake_list)
+    resolved = await client._resolve_session_id(
+        explicit=None, events=[], sessions_before={"primary-existing"}
+    )
+    assert resolved is None
+
