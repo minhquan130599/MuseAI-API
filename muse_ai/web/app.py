@@ -49,6 +49,12 @@ class LoginConfirmRequest(BaseModel):
     otp: str
 
 
+class ChatSendRequest(BaseModel):
+    message: str
+    session_id: str | None = None
+    timeout: float = 120.0
+
+
 @dataclass(slots=True)
 class JobRecord:
     id: str
@@ -144,6 +150,8 @@ class WebService:
         self.jobs = JobStore(WEB_STATE_DIR)
         self._auth: MuseAuth | None = None
         self._auth_lock = asyncio.Lock()
+        self._chat_client: MuseClient | None = None
+        self._chat_lock = asyncio.Lock()
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
     async def auth(self) -> MuseAuth:
@@ -171,6 +179,8 @@ class WebService:
         }
 
     async def start_login(self, email: str, region: str) -> None:
+        async with self._chat_lock:
+            await self.close_chat_client()
         async with self._auth_lock:
             if self._auth is not None:
                 await self._auth.close()
@@ -191,6 +201,47 @@ class WebService:
                 "authenticated": True,
                 "outcome": check.get("outcome", "validated"),
             }
+
+    async def close_chat_client(self) -> None:
+        client = self._chat_client
+        self._chat_client = None
+        if client is not None:
+            await client.close()
+
+    async def send_chat_message(
+        self,
+        *,
+        message: str,
+        session_id: str | None,
+        timeout: float,
+    ) -> dict[str, Any]:
+        async with self._chat_lock:
+            if self._chat_client is None:
+                auth = MuseAuth(state_dir=MUSE_STATE_DIR)
+                self._chat_client = MuseClient(
+                    auth,
+                    state_dir=MUSE_STATE_DIR,
+                )
+                try:
+                    await self._chat_client.connect()
+                except Exception:
+                    await self.close_chat_client()
+                    raise
+
+            try:
+                result = await self._chat_client.send_text(
+                    prompt=message,
+                    session_id=session_id,
+                    timeout=timeout,
+                )
+                return {
+                    "ok": True,
+                    "session_id": result.session_id,
+                    "text": result.text,
+                }
+            except Exception:
+                await self.close_chat_client()
+                raise
 
     async def run_generation(self, job_id: str, image_paths: list[Path]) -> None:
         job = self.jobs.get(job_id)
@@ -275,6 +326,7 @@ class WebService:
         if self._auth is not None:
             await self._auth.close()
             self._auth = None
+        await self.close_chat_client()
 
 
 service = WebService()
@@ -343,6 +395,34 @@ async def model_info() -> dict[str, Any]:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
     finally:
         await client.close()
+
+
+@app.post("/api/chat/send")
+async def chat_send(body: ChatSendRequest) -> dict[str, Any]:
+    message = body.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="Message is required")
+    if body.timeout < 5 or body.timeout > 900:
+        raise HTTPException(
+            status_code=400,
+            detail="timeout must be between 5 and 900 seconds",
+        )
+
+    auth = await service.auth_status()
+    if not auth["authenticated"]:
+        raise HTTPException(
+            status_code=401,
+            detail="Login to Muse before sending messages",
+        )
+
+    try:
+        return await service.send_chat_message(
+            message=message,
+            session_id=body.session_id,
+            timeout=body.timeout,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/api/generations")
