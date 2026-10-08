@@ -108,6 +108,24 @@
   font-style: italic;
   font-size: 13px;
 }
+.chat-attachments { display: grid; gap: 10px; margin-top: 12px; }
+.chat-attachment { border: 1px solid var(--line); border-radius: 12px; overflow: hidden; background: #080c15; }
+.chat-attachment img, .chat-attachment video {
+  display: block;
+  max-width: 100%;
+  width: auto;
+  max-height: 420px;
+  object-fit: contain;
+}
+.chat-attachment a {
+  display: block;
+  padding: 9px 12px;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+.chat-media-status, .chat-media-warning { font-size: 12px; margin: 10px 0 0; }
+.chat-media-status { color: #93c5fd; }
+.chat-media-warning { color: #fda4af; }
 .chat-compose { margin-top: 12px; }
 .chat-compose textarea {
   min-height: 86px;
