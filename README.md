@@ -395,7 +395,7 @@ Open:
 http://127.0.0.1:8787
 ```
 
-The UI supports Muse OTP login, text-to-video, optional reference images, background generation jobs, live status polling, in-browser video playback, and MP4 downloads.
+The UI supports Muse OTP login, normal multi-turn text chat with session reuse, text-to-video, optional reference images, background generation jobs, live status polling, in-browser video playback, and MP4 downloads. Use **Chat thường** to send ordinary messages (Enter to send, Shift+Enter for a new line). The UI keeps recent conversations and their Muse `session_id` in the browser's local storage, so you can switch threads after refreshing. Choose **+ Chat mới** to start a separate Muse conversation. Clearing site data also clears this local conversation history.
 
 REST API documentation is available at:
 
