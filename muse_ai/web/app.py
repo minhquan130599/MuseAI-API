@@ -235,14 +235,16 @@ class WebService:
                 self._chat_clients[account_id] = client
 
             try:
-                try:
-                    before = await client.history(session_id=session_id, limit=80)
-                    baseline = {
-                        f"{kind}:{ref.identity}"
-                        for kind, ref in media_references(before)
-                    }
-                except Exception:
-                    baseline = set()
+                baseline: set[str] = set()
+                if session_id is not None:
+                    try:
+                        before = await client.history(session_id=session_id, limit=80)
+                        baseline = {
+                            f"{kind}:{ref.identity}"
+                            for kind, ref in media_references(before)
+                        }
+                    except Exception:
+                        pass
 
                 result = await client.send_text(
                     prompt=message, session_id=session_id, timeout=timeout
