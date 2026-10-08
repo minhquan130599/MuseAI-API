@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>MuseAI Studio</title>
   <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/chat.css">
 </head>
 <body>
   <div class="noise"></div>
@@ -13,7 +14,7 @@
       <div>
         <div class="eyebrow">MUSEAI-API</div>
         <h1>MuseAI Studio</h1>
-        <p>Tạo và theo dõi video Muse trực tiếp từ trình duyệt.</p>
+        <p>Trò chuyện với Muse và tạo video trực tiếp từ trình duyệt.</p>
       </div>
       <div id="authPill" class="pill neutral"><span class="dot"></span><span>Đang kiểm tra</span></div>
     </header>
@@ -50,48 +51,83 @@
 
       <section class="panel create-panel">
         <div class="panel-head">
-          <div><span class="step">02</span><h2>Tạo video</h2></div>
+          <div><span class="step">02</span><h2 id="workspaceTitle">Tạo video</h2></div>
           <button id="refreshModel" class="ghost">Kiểm tra model</button>
         </div>
 
-        <label for="prompt">Prompt</label>
-        <textarea id="prompt" rows="9" placeholder="Mô tả video bạn muốn tạo..."></textarea>
-
-        <div class="prompt-actions">
-          <button class="chip" data-template="product">Quảng cáo sản phẩm</button>
-          <button class="chip" data-template="cinematic">Cinematic</button>
-          <button class="chip" data-template="social">Video dọc 9:16</button>
-          <span id="charCount" class="muted small">0 ký tự</span>
+        <div class="mode-tabs" role="tablist" aria-label="Chế độ Muse">
+          <button class="mode-tab" data-mode="chat" role="tab" aria-selected="false">💬 Chat thường</button>
+          <button class="mode-tab active" data-mode="video" role="tab" aria-selected="true">🎬 Tạo video</button>
         </div>
 
-        <label>Ảnh tham chiếu <span class="muted">(không bắt buộc)</span></label>
-        <label id="dropzone" class="dropzone">
-          <input id="images" type="file" accept="image/*" multiple hidden>
-          <div class="drop-icon">＋</div>
-          <strong>Thả ảnh vào đây hoặc bấm để chọn</strong>
-          <span>PNG · JPG · WEBP · có thể chọn nhiều ảnh</span>
-        </label>
-        <div id="imageList" class="image-list"></div>
+        <div id="chatMode" class="mode-view hidden">
+          <div class="chat-toolbar">
+            <div>
+              <strong>Trò chuyện với Muse</strong>
+              <div id="chatSession" class="muted small">Chưa có session</div>
+            </div>
+            <button id="newChat" class="ghost">+ Chat mới</button>
+          </div>
+          <label class="chat-history-label" for="chatThreads">Cuộc hội thoại đã lưu trên trình duyệt</label>
+          <select id="chatThreads" class="chat-thread-select" aria-label="Chọn cuộc hội thoại"></select>
 
-        <div class="controls">
-          <div>
-            <label>Số video tối thiểu</label>
-            <input id="minVideos" type="number" min="1" max="10" value="1">
+          <div id="chatMessages" class="chat-messages">
+            <div class="chat-empty">
+              <strong>Gửi tin nhắn bình thường tới Muse</strong>
+              <span>Session sẽ được giữ lại để bạn hỏi tiếp nhiều lượt.</span>
+            </div>
           </div>
-          <div>
-            <label>Timeout (giây)</label>
-            <input id="timeout" type="number" min="30" max="3600" value="600">
+
+          <div class="chat-compose">
+            <textarea id="chatInput" rows="4" placeholder="Nhập tin nhắn..."></textarea>
+            <div class="chat-compose-row">
+              <span class="muted small">Enter để gửi · Shift+Enter xuống dòng</span>
+              <button id="sendChat" class="button primary">Gửi tin nhắn →</button>
+            </div>
           </div>
+          <div id="chatMessage" class="message"></div>
         </div>
 
-        <button id="generate" class="button primary big">
-          <span>Tạo video</span><span class="arrow">→</span>
-        </button>
-        <div id="generateMessage" class="message"></div>
+        <div id="videoMode" class="mode-view">
+          <label for="prompt">Prompt</label>
+          <textarea id="prompt" rows="9" placeholder="Mô tả video bạn muốn tạo..."></textarea>
+
+          <div class="prompt-actions">
+            <button class="chip" data-template="product">Quảng cáo sản phẩm</button>
+            <button class="chip" data-template="cinematic">Cinematic</button>
+            <button class="chip" data-template="social">Video dọc 9:16</button>
+            <span id="charCount" class="muted small">0 ký tự</span>
+          </div>
+
+          <label>Ảnh tham chiếu <span class="muted">(không bắt buộc)</span></label>
+          <label id="dropzone" class="dropzone">
+            <input id="images" type="file" accept="image/*" multiple hidden>
+            <div class="drop-icon">＋</div>
+            <strong>Thả ảnh vào đây hoặc bấm để chọn</strong>
+            <span>PNG · JPG · WEBP · có thể chọn nhiều ảnh</span>
+          </label>
+          <div id="imageList" class="image-list"></div>
+
+          <div class="controls">
+            <div>
+              <label>Số video tối thiểu</label>
+              <input id="minVideos" type="number" min="1" max="10" value="1">
+            </div>
+            <div>
+              <label>Timeout (giây)</label>
+              <input id="timeout" type="number" min="30" max="3600" value="600">
+            </div>
+          </div>
+
+          <button id="generate" class="button primary big">
+            <span>Tạo video</span><span class="arrow">→</span>
+          </button>
+          <div id="generateMessage" class="message"></div>
+        </div>
       </section>
     </section>
 
-    <section class="panel jobs-panel">
+    <section id="jobsPanel" class="panel jobs-panel">
       <div class="panel-head jobs-head">
         <div><span class="step">03</span><h2>Generation jobs</h2></div>
         <button id="refreshJobs" class="ghost">Làm mới</button>
@@ -119,5 +155,6 @@
   </template>
 
   <script src="/app.js"></script>
+  <script src="/chat.js"></script>
 </body>
 </html>
