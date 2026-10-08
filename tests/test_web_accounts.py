@@ -136,6 +136,56 @@ def test_batch_endpoint_assigns_distinct_accounts(tmp_path, monkeypatch):
         assert too_many.status_code == 409
 
 
+
+
+
+def test_video_batch_with_four_uploaded_images(tmp_path, monkeypatch):
+    pool = ready_pool(tmp_path, 3)
+    job_store = JobStore(tmp_path / "jobs")
+    observed = []
+
+    async def fake_verify_all():
+        return None
+
+    async def fake_generation(job_id, images):
+        job = job_store.get(job_id)
+        observed.append({
+            "account_id": job.account_id,
+            "names": [path.name for path in images],
+            "content": [path.read_bytes() for path in images],
+        })
+        await job_store.update(job_id, status="completed", downloads=[])
+        await pool.release(job.account_id)
+
+    monkeypatch.setattr(pool, "verify_all", fake_verify_all)
+    monkeypatch.setattr(service, "accounts", pool)
+    monkeypatch.setattr(service, "jobs", job_store)
+    monkeypatch.setattr(service, "run_generation", fake_generation)
+
+    images = [
+        ("images", (f"photo-{number}.jpg", b"JPEG bytes " + bytes([number]), "image/jpeg"))
+        for number in range(1, 5)
+    ]
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/generations",
+            data={
+                "prompt": "Create a 15 second 9:16 product video from references",
+                "task_count": "2",
+                "timeout": "600",
+                "min_videos": "1",
+            },
+            files=images,
+        )
+        assert response.status_code == 202, response.text
+        assert response.json()["count"] == 2
+
+    assert len(observed) == 2
+    assert len({item["account_id"] for item in observed}) == 2
+    assert all(len(item["names"]) == 4 for item in observed)
+    assert all(item["content"][0] == b"JPEG bytes " + bytes([1]) for item in observed)
+
+
 def test_list_accounts_never_exposes_cookie_contents(tmp_path, monkeypatch):
     pool = ready_pool(tmp_path, 2)
     monkeypatch.setattr(service, "accounts", pool)
