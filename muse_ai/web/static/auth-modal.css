@@ -1,0 +1,43 @@
+/* Move authentication out of the workspace and into a status-triggered dialog. */
+.grid { grid-template-columns: minmax(0, 1fr); }
+.create-panel { min-width: 0; }
+.auth-trigger {
+  appearance: none;
+  color: var(--text);
+  font: inherit;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.auth-trigger:hover { border-color: rgba(139, 92, 246, .52); }
+.auth-trigger:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; }
+.auth-dialog {
+  position: fixed;
+  inset: 0;
+  width: min(460px, calc(100vw - 28px));
+  max-height: min(85vh, 700px);
+  margin: auto;
+  padding: 0;
+  color: var(--text);
+  border: 1px solid rgba(255,255,255,.15);
+  border-radius: 23px;
+  background: #10141e;
+  box-shadow: 0 30px 100px rgba(0, 0, 0, .55);
+  overflow-y: auto;
+}
+.auth-dialog:not([open]) { display: none; }
+.auth-dialog::backdrop {
+  background: rgba(0, 0, 0, .72);
+  backdrop-filter: blur(8px);
+}
+.auth-dialog-inner { padding: 26px; }
+.auth-dialog-head { display: flex; justify-content: space-between; gap: 15px; align-items: start; }
+.auth-dialog h2 { margin: 7px 0 0; }
+.auth-dialog .muted { margin: 13px 0; }
+.auth-dialog .row { display: flex; }
+.auth-dialog .row input { flex: 1; min-width: 0; }
+.auth-dialog .api-note { padding-top: 4px; }
+@media(max-width: 560px) {
+  .auth-dialog-inner { padding: 18px; }
+  .auth-dialog .row { flex-direction: column; }
+  .auth-dialog .row .button { width: 100%; }
+}
