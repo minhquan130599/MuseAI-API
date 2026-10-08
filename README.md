@@ -413,7 +413,7 @@ REST API documentation is available at:
 http://127.0.0.1:8787/docs
 ```
 
-Web job metadata and downloaded media are stored under `.muse-web/`, which is excluded from Git. Closing the browser tab does not stop a running job, but stopping the `muse-web` process does.
+Web job metadata and downloaded media are stored under `.muse-web/`, which is excluded from Git. Closing the browser tab does not stop a running job, but stopping the `muse-web` process does. Generated-video job cards use a compact display: prompts are collapsed to two lines, videos are hidden behind **Xem / tải video**, and verbose download diagnostics are collapsed. Expanding a video no longer resets playback when unrelated jobs refresh. Media `fs.raw` HTTP 404 means a referenced backing file is not available; the client retries once. If at least one MP4 was downloaded but another reference failed, the job is marked `completed_partial` and its valid MP4 remains playable.
 
 > The web server binds to `127.0.0.1` by default. Do not expose it publicly unless you add your own access control and deployment security.
 
