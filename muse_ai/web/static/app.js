@@ -24,6 +24,36 @@ const sendChatBtn = byId("sendChat");
 
 let selectedFiles = [];
 let pollTimer = null;
+let poolLoaded = false;
+let freeAccountCount = 0;
+let readyAccountCount = 0;
+let submittingGeneration = false;
+
+function syncGenerateAvailability() {
+  const taskCount = Number(byId("taskCount").value);
+  const validCount = Number.isInteger(taskCount) && taskCount >= 1 && taskCount <= 20;
+  generateBtn.disabled = submittingGeneration || !poolLoaded ||
+    !validCount || freeAccountCount < taskCount;
+  const hint = byId("poolHint");
+  if (poolLoaded && (!validCount || freeAccountCount < taskCount)) {
+    hint.textContent = validCount
+      ? "Không đủ tài khoản rảnh: cần " + taskCount + ", hiện có " +
+        freeAccountCount + ". Hãy giảm số task hoặc kiểm tra pool."
+      : "Số task phải từ 1 đến 20.";
+  }
+}
+
+window.addEventListener("muse-accounts-updated", (event) => {
+  const accounts = Array.isArray(event.detail) ? event.detail : [];
+  poolLoaded = true;
+  readyAccountCount = accounts.filter(a => a.enabled && a.status === "ready").length;
+  freeAccountCount = accounts.filter(a =>
+    a.enabled && a.status === "ready" && !a.busy
+  ).length;
+  syncGenerateAvailability();
+  sendChatBtn.disabled = readyAccountCount === 0;
+});
+byId("taskCount").addEventListener("input", syncGenerateAvailability);
 
 const templates = {
   product:
@@ -68,15 +98,20 @@ async function refreshAuth() {
         : "Quản lý tài khoản";
     byId("authDialogStatus").textContent =
       (state.ready_accounts || 0) + " tài khoản sẵn sàng";
-    generateBtn.disabled = !state.authenticated;
-    sendChatBtn.disabled = !state.authenticated;
+    // Account pool is authoritative for interactive controls.
+    // Do not overwrite the account-list availability with stale auth status.
+    if (!poolLoaded) generateBtn.disabled = true;
+    if (!poolLoaded) sendChatBtn.disabled = !state.authenticated;
   } catch {
     authPill.className = "pill auth-trigger bad";
     authPill.querySelector("span:last-child").textContent = "Mất kết nối";
     byId("authDialogStatus").textContent = "Không thể kiểm tra trạng thái";
-    generateBtn.disabled = true;
-    sendChatBtn.disabled = true;
+    if (!poolLoaded) {
+      generateBtn.disabled = true;
+      sendChatBtn.disabled = true;
+    }
   }
+  if (poolLoaded) syncGenerateAvailability();
 }
 
 sendOtp.addEventListener("click", async () => {
@@ -227,7 +262,14 @@ generateBtn.addEventListener("click", async () => {
   form.append("task_count", byId("taskCount").value);
   selectedFiles.forEach((file) => form.append("images", file, file.name));
 
-  generateBtn.disabled = true;
+  if (submittingGeneration) return;
+  if (!poolLoaded || freeAccountCount < Number(byId("taskCount").value)) {
+    setMessage(generateMessage, "Không đủ tài khoản rảnh để tạo batch.", "error");
+    syncGenerateAvailability();
+    return;
+  }
+  submittingGeneration = true;
+  syncGenerateAvailability();
   setMessage(generateMessage, "Đang gửi generation job...");
 
   try {
@@ -252,7 +294,9 @@ generateBtn.addEventListener("click", async () => {
   } catch (err) {
     setMessage(generateMessage, err.message, "error");
   } finally {
-    await refreshAuth();
+    submittingGeneration = false;
+    await window.refreshMuseAccounts?.();
+    syncGenerateAvailability();
   }
 });
 
