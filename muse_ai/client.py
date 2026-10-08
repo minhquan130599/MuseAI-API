@@ -487,6 +487,18 @@ class MuseClient:
                         await self.download_video(ref, out / filename)
                     )
                 except Exception as exc:
+                    # Media presentations sometimes arrive before their
+                    # backing /fs/raw objects. Retry one 404 before recording
+                    # the failed ref; other videos may already be available.
+                    if "not_found" in str(exc) or "HTTP 404" in str(exc):
+                        await asyncio.sleep(2.0)
+                        try:
+                            downloaded.append(
+                                await self.download_video(ref, out / filename)
+                            )
+                            continue
+                        except Exception as retry_exc:
+                            exc = retry_exc
                     download_errors.append(
                         f"video[{index + 1}] {ref.identity}: {exc}"
                     )
