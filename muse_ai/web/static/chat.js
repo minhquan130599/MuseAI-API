@@ -14,7 +14,9 @@
   const messageBox = el("chatMessages");
   const chatNotice = el("chatMessage");
   const threadSelect = el("chatThreads");
+  const accountSelect = el("chatAccount");
   const sessionInfo = el("chatSession");
+  let knownAccounts = [];
   const title = el("workspaceTitle");
   let threads = [];
   let activeId = null;
@@ -68,6 +70,7 @@
       id: makeId(),
       name: "Cuộc trò chuyện mới",
       sessionId: null,
+      accountId: accountSelect.value || null,
       messages: [],
       updatedAt: Date.now()
     };
@@ -89,6 +92,7 @@
     }
     if (activeId) threadSelect.value = activeId;
     const thread = activeThread();
+    if (thread && thread.accountId) accountSelect.value = thread.accountId;
     sessionInfo.textContent = thread?.sessionId
       ? "Muse session: " + thread.sessionId
       : "Chưa có session · Lượt đầu sẽ tạo session mới";
@@ -114,6 +118,49 @@
         body.className = "chat-bubble-text";
         body.textContent = message.text || "";
         wrapper.append(label, body);
+        if (Array.isArray(message.files) && message.files.length) {
+          const gallery = document.createElement("div");
+          gallery.className = "chat-attachments";
+          for (const file of message.files) {
+            if (!file || typeof file.url !== "string" ||
+                !/^\/api\/chat\/media\/[a-f0-9]+\/files\/[\w.\-]+$/.test(file.url)) {
+              continue;
+            }
+            const item = document.createElement("div");
+            item.className = "chat-attachment";
+            if (file.kind === "image") {
+              const img = document.createElement("img");
+              img.src = file.url;
+              img.alt = file.filename || "Ảnh từ Muse";
+              img.loading = "lazy";
+              item.appendChild(img);
+            } else if (file.kind === "video") {
+              const video = document.createElement("video");
+              video.src = file.url;
+              video.preload = "metadata";
+              video.controls = true;
+              item.appendChild(video);
+            }
+            const link = document.createElement("a");
+            link.href = file.url + "?download=1";
+            link.textContent = "↓ Tải " + (file.filename || "tệp");
+            link.download = file.filename || "";
+            item.appendChild(link);
+            gallery.appendChild(item);
+          }
+          if (gallery.childNodes.length) wrapper.appendChild(gallery);
+        }
+        if (message.mediaStatus === "watching" && message.mediaExpected) {
+          const status = document.createElement("p");
+          status.className = "chat-media-status";
+          status.textContent = "Đang kiểm tra tệp đính kèm từ Muse…";
+          wrapper.appendChild(status);
+        } else if (Array.isArray(message.mediaErrors) && message.mediaErrors.length) {
+          const warning = document.createElement("p");
+          warning.className = "chat-media-warning";
+          warning.textContent = message.mediaErrors.join(" ");
+          wrapper.appendChild(warning);
+        }
         messageBox.appendChild(wrapper);
       }
     }
@@ -127,6 +174,42 @@
   }
 
   let pendingThreadId = null;
+  const activeMediaPolls = new Set();
+
+  async function followMedia(thread, reply) {
+    const jobId = reply.mediaJobId;
+    if (!jobId || activeMediaPolls.has(jobId)) return;
+    activeMediaPolls.add(jobId);
+    let failures = 0;
+    try {
+      while (reply.mediaStatus === "watching") {
+        const response = await fetch("/api/chat/media/" + encodeURIComponent(jobId), {
+          cache: "no-store"
+        });
+        if (!response.ok) {
+          failures++;
+          if (failures >= 3) throw new Error("Không kiểm tra được tệp từ Muse.");
+        } else {
+          failures = 0;
+          const data = await response.json();
+          reply.files = Array.isArray(data.files) ? data.files : [];
+          reply.mediaErrors = Array.isArray(data.errors) ? data.errors : [];
+          reply.mediaStatus = data.status || "watching";
+          persist();
+          if (activeId === thread.id) render();
+        }
+        if (reply.mediaStatus !== "watching") break;
+        await new Promise((resolve) => setTimeout(resolve, 3000));
+      }
+    } catch (err) {
+      reply.mediaStatus = "failed";
+      reply.mediaErrors = [String(err.message || err)];
+      persist();
+      if (activeId === thread.id) render();
+    } finally {
+      activeMediaPolls.delete(jobId);
+    }
+  }
 
   function setMode(mode) {
     const chat = mode === "chat";
@@ -150,6 +233,18 @@
     if (!message || busy) return;
     if (!activeThread()) createThread();
     const thread = activeThread();
+    if (!thread.accountId && thread.sessionId) {
+      chatNotice.textContent = "Hội thoại cũ không gắn tài khoản. Hãy tạo Chat mới và chọn tài khoản Muse.";
+      chatNotice.className = "message error";
+      return;
+    }
+    if (!thread.accountId) thread.accountId = accountSelect.value || null;
+    if (!thread.accountId ||
+        !knownAccounts.some(a => a.id === thread.accountId && a.enabled && a.status === "ready")) {
+      chatNotice.textContent = "Vui lòng chọn tài khoản Muse đang sẵn sàng để chat.";
+      chatNotice.className = "message error";
+      return;
+    }
     const requestedId = thread.id;
     busy = true;
     pendingThreadId = requestedId;
@@ -174,6 +269,7 @@
         headers: {"Content-Type": "application/json"},
         body: JSON.stringify({
           message,
+          account_id: thread.accountId,
           session_id: thread.sessionId || null,
           timeout: 120
         })
@@ -188,10 +284,20 @@
         throw new Error("Muse chưa trả về nội dung text.");
       }
       thread.sessionId = data.session_id || thread.sessionId;
-      thread.messages.push({role: "assistant", text: data.text});
+      const reply = {
+        role: "assistant",
+        text: typeof data.text === "string" ? data.text : "",
+        files: Array.isArray(data.attachments) ? data.attachments : [],
+        mediaJobId: data.media_job_id || null,
+        mediaStatus: data.media_job_id ? "watching" : "completed",
+        mediaExpected: Boolean(data.media_expected),
+        mediaErrors: []
+      };
+      thread.messages.push(reply);
       thread.messages = thread.messages.slice(-MAX_MESSAGES);
       thread.updatedAt = Date.now();
       persist();
+      if (reply.mediaJobId) void followMedia(thread, reply);
     } catch (err) {
       chatNotice.textContent = err.message +
         " Có thể Muse đã nhận yêu cầu; hãy kiểm tra trước khi gửi lại để tránh lặp.";
@@ -214,6 +320,42 @@
     persist();
     render();
   });
+  accountSelect.addEventListener("change", () => {
+    const thread = activeThread();
+    if (!thread || thread.messages.length || thread.sessionId) {
+      createThread();
+    } else {
+      thread.accountId = accountSelect.value || null;
+      persist();
+      render();
+    }
+  });
+  window.addEventListener("muse-accounts-updated", (event) => {
+    knownAccounts = event.detail || [];
+    const previous = accountSelect.value;
+    accountSelect.replaceChildren();
+    const placeholder = document.createElement("option");
+    placeholder.value = "";
+    placeholder.textContent = "Chọn tài khoản Muse";
+    accountSelect.appendChild(placeholder);
+    for (const account of knownAccounts) {
+      if (account.enabled && account.status === "ready") {
+        const option = document.createElement("option");
+        option.value = account.id;
+        option.textContent = account.label || account.email || account.id;
+        accountSelect.appendChild(option);
+      }
+    }
+    const thread = activeThread();
+    if (thread?.accountId) accountSelect.value = thread.accountId;
+    else if (previous) accountSelect.value = previous;
+    else if (accountSelect.options.length === 2) accountSelect.value = accountSelect.options[1].value;
+    if (thread && !thread.accountId && !thread.messages.length &&
+        !thread.sessionId && accountSelect.value) {
+      thread.accountId = accountSelect.value;
+      persist();
+    }
+  });
   sendButton.addEventListener("click", sendMessage);
   chatInput.addEventListener("keydown", (event) => {
     if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
@@ -224,4 +366,11 @@
   load();
   if (!activeThread()) createThread();
   setMode("video");
+  for (const thread of threads) {
+    for (const message of thread.messages) {
+      if (message.mediaJobId && message.mediaStatus === "watching") {
+        void followMedia(thread, message);
+      }
+    }
+  }
 })();
