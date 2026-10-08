@@ -15,6 +15,9 @@ from typing import Any
 import uvicorn
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse
+
+from .chat_media import ChatMediaManager, media_references
+from .account_pool import AccountPool
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
 
@@ -25,7 +28,7 @@ PACKAGE_DIR = Path(__file__).resolve().parent
 STATIC_DIR = PACKAGE_DIR / "static"
 WEB_STATE_DIR = Path(os.environ.get("MUSE_WEB_STATE_DIR", ".muse-web"))
 MUSE_STATE_DIR = Path(os.environ.get("MUSE_STATE_DIR", ".muse-state"))
-MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MUSE_WEB_CONCURRENCY", "2")))
+MAX_CONCURRENT_JOBS = max(1, int(os.environ.get("MUSE_WEB_CONCURRENCY", "20")))
 
 
 def utc_now() -> str:
@@ -51,8 +54,17 @@ class LoginConfirmRequest(BaseModel):
 
 class ChatSendRequest(BaseModel):
     message: str
+    account_id: str | None = None
     session_id: str | None = None
     timeout: float = 120.0
+
+
+class AccountOtpRequest(BaseModel):
+    otp: str
+
+
+class AccountEnabledRequest(BaseModel):
+    enabled: bool
 
 
 @dataclass(slots=True)
@@ -65,6 +77,9 @@ class JobRecord:
     started_at: str | None = None
     finished_at: str | None = None
     session_id: str | None = None
+    account_id: str | None = None
+    account_label: str | None = None
+    batch_id: str | None = None
     images: list[str] = field(default_factory=list)
     min_videos: int = 1
     timeout: float = 600.0
@@ -148,65 +163,43 @@ class JobStore:
 class WebService:
     def __init__(self) -> None:
         self.jobs = JobStore(WEB_STATE_DIR)
-        self._auth: MuseAuth | None = None
-        self._auth_lock = asyncio.Lock()
-        self._chat_client: MuseClient | None = None
-        self._chat_lock = asyncio.Lock()
+        self.accounts = AccountPool(WEB_STATE_DIR / "accounts", legacy_state=MUSE_STATE_DIR)
+        self._legacy_pending_account_id: str | None = None
+        self._chat_clients: dict[str, MuseClient] = {}
+        self._chat_locks: dict[str, asyncio.Lock] = {}
+        self.chat_media = ChatMediaManager(WEB_STATE_DIR / "chat-media")
         self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
-    async def auth(self) -> MuseAuth:
-        if self._auth is None:
-            self._auth = MuseAuth(state_dir=MUSE_STATE_DIR)
-            if self._auth.cookie_path.exists():
-                try:
-                    await self._auth.load_cookies()
-                except Exception:
-                    pass
-        return self._auth
-
     async def auth_status(self) -> dict[str, Any]:
-        auth = await self.auth()
-        if not auth.cookie_path.exists():
-            return {"authenticated": False, "outcome": "no_session"}
-        try:
-            check = await auth.auth_check()
-        except Exception as exc:
-            return {"authenticated": False, "outcome": "error", "detail": str(exc)}
+        accounts = self.accounts.list()
+        ready = sum(a["enabled"] and a["status"] == "ready" for a in accounts)
         return {
-            "authenticated": check.get("ok") is True,
-            "outcome": check.get("outcome")
-            or ("validated" if check.get("ok") else "invalid"),
+            "authenticated": ready > 0,
+            "outcome": "validated" if ready else "no_ready_accounts",
+            "total_accounts": len(accounts),
+            "ready_accounts": ready,
         }
 
     async def start_login(self, email: str, region: str) -> None:
-        async with self._chat_lock:
-            await self.close_chat_client()
-        async with self._auth_lock:
-            if self._auth is not None:
-                await self._auth.close()
-            self._auth = MuseAuth(state_dir=MUSE_STATE_DIR)
-            await self._auth.restart_login()
-            await self._auth.send_otp(email, region)
+        record = await self.accounts.begin_login(email, region)
+        self._legacy_pending_account_id = record["id"]
 
     async def confirm_login(self, otp: str) -> dict[str, Any]:
-        async with self._auth_lock:
-            auth = await self.auth()
-            await auth.confirm_otp(otp.strip())
-            await auth.save_account()
-            check = await auth.auth_check()
-            if check.get("ok") is not True:
-                raise HTTPException(status_code=401, detail="Muse session validation failed")
-            await auth.save_cookies()
-            return {
-                "authenticated": True,
-                "outcome": check.get("outcome", "validated"),
-            }
+        if not self._legacy_pending_account_id:
+            raise ValueError("Send OTP first")
+        record = await self.accounts.confirm_login(self._legacy_pending_account_id, otp)
+        self._legacy_pending_account_id = None
+        return {"authenticated": True, "outcome": "validated", "account": record}
 
-    async def close_chat_client(self) -> None:
-        client = self._chat_client
-        self._chat_client = None
-        if client is not None:
-            await client.close()
+    async def close_chat_client(self, account_id: str | None = None) -> None:
+        ids = [account_id] if account_id else list(self._chat_clients)
+        for item_id in ids:
+            client = self._chat_clients.pop(item_id, None)
+            if client is not None:
+                await client.close()
+
+    def chat_lock(self, account_id: str) -> asyncio.Lock:
+        return self._chat_locks.setdefault(account_id, asyncio.Lock())
 
     async def send_chat_message(
         self,
@@ -214,36 +207,118 @@ class WebService:
         message: str,
         session_id: str | None,
         timeout: float,
+        account_id: str | None = None,
     ) -> dict[str, Any]:
-        async with self._chat_lock:
-            if self._chat_client is None:
-                auth = MuseAuth(state_dir=MUSE_STATE_DIR)
-                self._chat_client = MuseClient(
-                    auth,
-                    state_dir=MUSE_STATE_DIR,
-                )
+        ready = [a for a in self.accounts.list() if a["enabled"] and a["status"] == "ready"]
+        if account_id is None:
+            if len(ready) != 1:
+                raise ValueError("Please select a Muse account for this chat")
+            account_id = ready[0]["id"]
+        account = self.accounts.get(account_id)
+        if account.status != "ready" or not account.enabled:
+            account = self.accounts.get((await self.accounts.verify(account_id))["id"])
+            if account.status != "ready" or not account.enabled:
+                raise ValueError("Muse account is not logged in or is disabled")
+        if self.accounts.is_busy(account_id):
+            raise ValueError("Tài khoản đang dùng để tạo video; hãy chọn tài khoản khác")
+
+        async with self.chat_lock(account_id):
+            client = self._chat_clients.get(account_id)
+            if client is None:
+                state = self.accounts.state_dir(account_id)
+                client = MuseClient(MuseAuth(state_dir=state), state_dir=state)
                 try:
-                    await self._chat_client.connect()
+                    await client.connect()
                 except Exception:
-                    await self.close_chat_client()
+                    await client.close()
                     raise
+                self._chat_clients[account_id] = client
 
             try:
-                result = await self._chat_client.send_text(
-                    prompt=message,
-                    session_id=session_id,
-                    timeout=timeout,
+                try:
+                    before = await client.history(session_id=session_id, limit=80)
+                    baseline = {
+                        f"{kind}:{ref.identity}"
+                        for kind, ref in media_references(before)
+                    }
+                except Exception:
+                    baseline = set()
+
+                result = await client.send_text(
+                    prompt=message, session_id=session_id, timeout=timeout
                 )
+                media_expected = any(
+                    word in message.casefold()
+                    for word in (
+                        "ảnh", "hình", "video", "clip", "vẽ", "tệp",
+                        "file", "pdf", "docx", "excel", "pptx", "xuất bản",
+                        "generate image", "generate video", "render",
+                        "download", "create image", "create video",
+                    )
+                )
+                media_job = None
+                if result.session_id:
+                    media_job = self.chat_media.start(
+                        session_id=result.session_id,
+                        baseline=baseline,
+                        fetch=lambda sid: self._fetch_chat_history(account_id, sid),
+                        download=lambda kind, ref, target: self._download_chat_media(
+                            account_id, kind, ref, target
+                        ),
+                        timeout=300 if media_expected else 20,
+                    )
                 return {
                     "ok": True,
+                    "account_id": account_id,
                     "session_id": result.session_id,
                     "text": result.text,
+                    "media_job_id": media_job.id if media_job else None,
+                    "media_expected": media_expected,
+                    "attachments": [],
                 }
             except Exception:
-                await self.close_chat_client()
+                await self.close_chat_client(account_id)
                 raise
 
+    async def _fetch_chat_history(self, account_id: str, session_id: str) -> Any:
+        async with self.chat_lock(account_id):
+            client = self._chat_clients.get(account_id)
+            if client is None:
+                raise RuntimeError("Muse chat connection has closed")
+            return await client.history(session_id=session_id, limit=80)
+
+    async def _download_chat_media(
+        self, account_id: str, kind: str, ref: Any, target: Path
+    ) -> Path:
+        async with self.chat_lock(account_id):
+            client = self._chat_clients.get(account_id)
+            if client is None:
+                raise RuntimeError("Muse chat connection has closed")
+            if kind == "video":
+                return await client.download_video(ref, target)
+            if kind == "image":
+                return await client.download_image(ref, target)
+            if kind == "file":
+                return await client._fs().download(ref.path, target)
+            raise ValueError("Unsupported Muse attachment type")
+
     async def run_generation(self, job_id: str, image_paths: list[Path]) -> None:
+        job = self.jobs.get(job_id)
+        try:
+            await self._run_generation(job_id, image_paths)
+        except asyncio.CancelledError:
+            await self.jobs.update(
+                job_id, status="cancelled", message="Đã hủy job",
+                finished_at=utc_now()
+            )
+            raise
+        finally:
+            if job.account_id:
+                await self.accounts.release(job.account_id)
+            shutil.rmtree(self.jobs.upload_root / job_id, ignore_errors=True)
+            self.jobs.tasks.pop(job_id, None)
+
+    async def _run_generation(self, job_id: str, image_paths: list[Path]) -> None:
         job = self.jobs.get(job_id)
         async with self._semaphore:
             await self.jobs.update(
@@ -252,8 +327,9 @@ class WebService:
                 message="Đang kết nối Muse / Hatch",
                 started_at=utc_now(),
             )
-            auth = MuseAuth(state_dir=MUSE_STATE_DIR)
-            client = MuseClient(auth, state_dir=MUSE_STATE_DIR)
+            state = self.accounts.state_dir(job.account_id)
+            auth = MuseAuth(state_dir=state)
+            client = MuseClient(auth, state_dir=state)
             try:
                 await client.connect()
                 await self.jobs.update(
@@ -270,18 +346,16 @@ class WebService:
                     min_videos=job.min_videos,
                     download=True,
                 )
+                downloads = [path.name for path in result.downloaded]
                 videos = [
                     {
-                        "path": ref.path,
-                        "url": ref.url,
-                        "mime_type": ref.mime_type,
-                        "resource_id": ref.resource_id,
-                        "media_handle": ref.media_handle,
+                        "filename": name,
+                        "url": f"/api/generations/{job_id}/files/{name}",
+                        "mime_type": "video/mp4",
                     }
-                    for ref in result.videos
+                    for name in downloads
                 ]
-                downloads = [path.name for path in result.downloaded]
-                status = "completed" if downloads or videos else "completed_no_media"
+                status = "completed" if downloads else "completed_no_media"
                 message = (
                     f"Hoàn tất: {len(downloads)} file đã tải về"
                     if downloads
@@ -315,18 +389,15 @@ class WebService:
                 )
             finally:
                 await client.close()
-                upload_dir = self.jobs.upload_root / job_id
-                shutil.rmtree(upload_dir, ignore_errors=True)
-                self.jobs.tasks.pop(job_id, None)
 
     async def shutdown(self) -> None:
+        await self.chat_media.close()
         for task in list(self.jobs.tasks.values()):
             if not task.done():
                 task.cancel()
-        if self._auth is not None:
-            await self._auth.close()
-            self._auth = None
+        await asyncio.gather(*list(self.jobs.tasks.values()), return_exceptions=True)
         await self.close_chat_client()
+        await self.accounts.close()
 
 
 service = WebService()
@@ -357,6 +428,91 @@ async def health() -> dict[str, Any]:
     }
 
 
+@app.get("/api/accounts")
+async def list_accounts(refresh: bool = False) -> dict[str, Any]:
+    if refresh:
+        await service.accounts.verify_all()
+    accounts = service.accounts.list()
+    return {
+        "accounts": accounts,
+        "total": len(accounts),
+        "ready": sum(a["enabled"] and a["status"] == "ready" for a in accounts),
+        "available": sum(
+            a["enabled"] and a["status"] == "ready" and not a["busy"]
+            for a in accounts
+        ),
+    }
+
+
+@app.post("/api/accounts")
+async def add_account(body: LoginStartRequest) -> dict[str, Any]:
+    try:
+        return await service.accounts.begin_login(body.email, body.region)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Không gửi được OTP Muse") from exc
+
+
+@app.post("/api/accounts/{account_id}/otp")
+async def confirm_account_otp(
+    account_id: str, body: AccountOtpRequest
+) -> dict[str, Any]:
+    try:
+        return await service.accounts.confirm_login(account_id, body.otp)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Không xác nhận được OTP Muse") from exc
+
+
+@app.post("/api/accounts/{account_id}/resend")
+async def resend_account_otp(account_id: str) -> dict[str, Any]:
+    try:
+        record = service.accounts.get(account_id)
+        if not record.email:
+            raise ValueError("Legacy account requires an email to login")
+        return await service.accounts.begin_login(record.email)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail="Không gửi được OTP Muse") from exc
+
+
+@app.post("/api/accounts/{account_id}/verify")
+async def verify_account(account_id: str) -> dict[str, Any]:
+    try:
+        return await service.accounts.verify(account_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/accounts/{account_id}")
+async def set_account_enabled(
+    account_id: str, body: AccountEnabledRequest
+) -> dict[str, Any]:
+    try:
+        return await service.accounts.set_enabled(account_id, body.enabled)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
+@app.delete("/api/accounts/{account_id}")
+async def remove_account(account_id: str) -> dict[str, Any]:
+    try:
+        if service.accounts.is_busy(account_id):
+            raise RuntimeError("Account is running a task")
+        await service.close_chat_client(account_id)
+        await service.accounts.remove(account_id)
+        return {"ok": True}
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except RuntimeError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+
 @app.get("/api/auth/status")
 async def auth_status() -> dict[str, Any]:
     return await service.auth_status()
@@ -384,9 +540,23 @@ async def auth_confirm(body: LoginConfirmRequest) -> dict[str, Any]:
 
 
 @app.get("/api/model")
-async def model_info() -> dict[str, Any]:
-    auth = MuseAuth(state_dir=MUSE_STATE_DIR)
-    client = MuseClient(auth, state_dir=MUSE_STATE_DIR)
+async def model_info(account_id: str | None = None) -> dict[str, Any]:
+    available = [a for a in service.accounts.list()
+                 if a["enabled"] and a["status"] == "ready"]
+    if not account_id and not available:
+        await service.accounts.verify_all()
+        available = [a for a in service.accounts.list()
+                     if a["enabled"] and a["status"] == "ready"]
+    if not account_id:
+        if not available:
+            raise HTTPException(status_code=400, detail="No ready Muse account")
+        account_id = available[0]["id"]
+    record = service.accounts.get(account_id)
+    if not record.enabled or record.status != "ready":
+        raise HTTPException(status_code=400, detail="Account is not ready")
+    state = service.accounts.state_dir(account_id)
+    auth = MuseAuth(state_dir=state)
+    client = MuseClient(auth, state_dir=state)
     try:
         await client.connect()
         value = await client.model_get()
@@ -408,21 +578,42 @@ async def chat_send(body: ChatSendRequest) -> dict[str, Any]:
             detail="timeout must be between 5 and 900 seconds",
         )
 
-    auth = await service.auth_status()
-    if not auth["authenticated"]:
-        raise HTTPException(
-            status_code=401,
-            detail="Login to Muse before sending messages",
-        )
-
     try:
         return await service.send_chat_message(
             message=message,
+            account_id=body.account_id,
             session_id=body.session_id,
             timeout=body.timeout,
         )
+    except (ValueError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+
+@app.get("/api/chat/media/{media_id}")
+async def chat_media_status(media_id: str) -> dict[str, Any]:
+    media = service.chat_media.get(media_id)
+    if media is None:
+        raise HTTPException(status_code=404, detail="Chat media job not found")
+    return media.public()
+
+
+@app.get("/api/chat/media/{media_id}/files/{filename}")
+async def chat_media_file(
+    media_id: str, filename: str, download: bool = False
+) -> FileResponse:
+    path = service.chat_media.file_path(media_id, filename)
+    if path is None:
+        raise HTTPException(status_code=404, detail="Media file not found")
+    import mimetypes
+
+    return FileResponse(
+        path,
+        filename=filename,
+        media_type=mimetypes.guess_type(filename)[0] or "application/octet-stream",
+        content_disposition_type="attachment" if download else "inline",
+    )
 
 
 @app.get("/api/generations")
@@ -440,6 +631,7 @@ async def create_generation(
     prompt: str = Form(...),
     timeout: float = Form(600.0),
     min_videos: int = Form(1),
+    task_count: int = Form(1),
     images: list[UploadFile] = File(default=[]),
 ) -> dict[str, Any]:
     prompt = prompt.strip()
@@ -447,60 +639,97 @@ async def create_generation(
         raise HTTPException(status_code=400, detail="Prompt is required")
     if timeout < 30 or timeout > 3600:
         raise HTTPException(
-            status_code=400,
-            detail="timeout must be between 30 and 3600 seconds",
+            status_code=400, detail="Timeout must be between 30 and 3600 seconds"
         )
     if min_videos < 1 or min_videos > 10:
-        raise HTTPException(
-            status_code=400,
-            detail="min_videos must be between 1 and 10",
-        )
+        raise HTTPException(status_code=400, detail="min_videos must be between 1 and 10")
+    if task_count < 1 or task_count > 20:
+        raise HTTPException(status_code=400, detail="task_count must be between 1 and 20")
 
-    auth = await service.auth_status()
-    if not auth["authenticated"]:
-        raise HTTPException(
-            status_code=401,
-            detail="Login to Muse before creating a video",
-        )
-
-    job_id = uuid.uuid4().hex[:12]
-    upload_dir = service.jobs.upload_root / job_id
-    upload_dir.mkdir(parents=True, exist_ok=True)
-    saved_images: list[Path] = []
-    image_names: list[str] = []
-
+    await service.accounts.verify_all()
     try:
+        selected = await service.accounts.reserve_random(task_count)
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+    batch_id = uuid.uuid4().hex[:12]
+    jobs: list[JobRecord] = []
+    prepared: list[tuple[JobRecord, list[Path]]] = []
+    try:
+        job_files: list[tuple[Path, list[Path]]] = []
+        for account in selected:
+            job_id = uuid.uuid4().hex[:12]
+            upload_dir = service.jobs.upload_root / job_id
+            upload_dir.mkdir(parents=True, exist_ok=True)
+            job_files.append((upload_dir, []))
+
+        image_names: list[str] = []
         for index, upload in enumerate(images):
             if not upload.filename:
                 continue
+            if not (upload.content_type or "").startswith("image/"):
+                raise ValueError("Reference files must be images")
             name = safe_filename(upload.filename, f"image-{index + 1}.bin")
-            target = upload_dir / f"{index + 1:02d}-{name}"
-            with target.open("wb") as handle:
+            targets = []
+            for upload_dir, paths in job_files:
+                path = upload_dir / f"{index + 1:02d}-{name}"
+                targets.append((path, paths))
+            # Stream once to the first account, copy into the remaining job folders.
+            first, first_paths = targets[0]
+            total = 0
+            with first.open("wb") as handle:
                 while chunk := await upload.read(1024 * 1024):
+                    total += len(chunk)
+                    if total > 32 * 1024 * 1024:
+                        raise ValueError("Maximum 32 MB per reference image")
                     handle.write(chunk)
-            saved_images.append(target)
+            first_paths.append(first)
+            for target, paths in targets[1:]:
+                shutil.copyfile(first, target)
+                paths.append(target)
             image_names.append(name)
-    except Exception:
-        shutil.rmtree(upload_dir, ignore_errors=True)
+
+        for account, (upload_dir, paths) in zip(selected, job_files):
+            job_id = upload_dir.name
+            job = JobRecord(
+                id=job_id, prompt=prompt, batch_id=batch_id,
+                account_id=account.id, account_label=account.label,
+                images=image_names.copy(), timeout=timeout, min_videos=min_videos,
+            )
+            prepared.append((job, paths))
+
+        for job, paths in prepared:
+            await service.jobs.add(job)
+            jobs.append(job)
+
+        for job, paths in prepared:
+            task = asyncio.create_task(
+                service.run_generation(job.id, paths),
+                name=f"muse-generation-{job.id}",
+            )
+            service.jobs.tasks[job.id] = task
+
+        return {
+            "ok": True, "batch_id": batch_id, "count": len(jobs),
+            "jobs": [job.public() for job in jobs],
+        }
+    except BaseException as exc:
+        active_accounts = {
+            job.account_id for job in jobs
+            if job.id in service.jobs.tasks
+        }
+        for account in selected:
+            if account.id not in active_accounts:
+                await service.accounts.release(account.id)
+        for upload_dir, _ in job_files:
+            if upload_dir.name not in service.jobs.tasks:
+                shutil.rmtree(upload_dir, ignore_errors=True)
+        if isinstance(exc, ValueError):
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
         raise
     finally:
         for upload in images:
             await upload.close()
-
-    job = JobRecord(
-        id=job_id,
-        prompt=prompt,
-        images=image_names,
-        timeout=timeout,
-        min_videos=min_videos,
-    )
-    await service.jobs.add(job)
-    task = asyncio.create_task(
-        service.run_generation(job_id, saved_images),
-        name=f"muse-generation-{job_id}",
-    )
-    service.jobs.tasks[job_id] = task
-    return job.public()
 
 
 @app.post("/api/generations/{job_id}/cancel")
