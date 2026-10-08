@@ -6,6 +6,8 @@
   <title>MuseAI Studio</title>
   <link rel="stylesheet" href="/styles.css">
   <link rel="stylesheet" href="/chat.css">
+  <link rel="stylesheet" href="/auth-modal.css">
+  <link rel="stylesheet" href="/accounts.css">
 </head>
 <body>
   <div class="noise"></div>
@@ -16,42 +18,53 @@
         <h1>MuseAI Studio</h1>
         <p>Trò chuyện với Muse và tạo video trực tiếp từ trình duyệt.</p>
       </div>
-      <div id="authPill" class="pill neutral"><span class="dot"></span><span>Đang kiểm tra</span></div>
+      <button id="authPill" type="button" class="pill neutral auth-trigger" aria-haspopup="dialog" aria-controls="authDialog" title="Xem trạng thái / đăng nhập Muse"><span class="dot"></span><span>Đang kiểm tra</span></button>
     </header>
 
-    <section class="grid">
-      <aside class="panel auth-panel">
-        <div class="panel-head">
-          <div><span class="step">01</span><h2>Kết nối Muse</h2></div>
+    <dialog id="authDialog" class="auth-dialog" aria-labelledby="authTitle">
+      <div class="auth-dialog-inner">
+        <div class="auth-dialog-head">
+          <div>
+            <div class="eyebrow">TÀI KHOẢN MUSE</div>
+            <h2 id="authTitle">Trạng thái &amp; đăng nhập</h2>
+          </div>
+          <button id="closeAuth" type="button" class="ghost" aria-label="Đóng popup">✕</button>
         </div>
-        <p class="muted">Đăng nhập OTP một lần. Session được lưu cục bộ trong <code>.muse-state</code>.</p>
-
-        <label>Email Muse</label>
+        <p class="muted">Trạng thái hiện tại: <strong id="authDialogStatus">Đang kiểm tra...</strong></p>
+        <p class="muted small">Mỗi tài khoản dùng session riêng trong <code>.muse-web/accounts/</code>. Bạn có thể gửi OTP cho nhiều email và xác nhận từng tài khoản.</p>
+        <div class="account-pool-heading">
+          <strong>Danh sách tài khoản</strong>
+          <button id="refreshAccounts" type="button" class="ghost">Kiểm tra tất cả</button>
+        </div>
+        <div id="accountList" class="account-list" aria-live="polite"></div>
+        <label for="email">Thêm tài khoản Muse bằng email</label>
         <div class="row">
-          <input id="email" type="email" placeholder="you@example.com" autocomplete="email">
-          <button id="sendOtp" class="button secondary">Gửi OTP</button>
+          <textarea id="email" rows="2" placeholder="email1@example.com, email2@example.com hoặc mỗi email một dòng"></textarea>
+          <button id="sendOtp" class="button secondary">+ Thêm / Gửi OTP hàng loạt</button>
         </div>
-
         <div id="otpArea" class="otp-area hidden">
-          <label>Mã OTP</label>
+          <label for="otpAccountSelect">Tài khoản đang chờ xác nhận</label>
+          <select id="otpAccountSelect"></select>
+          <label for="otp">Mã OTP</label>
           <div class="row">
             <input id="otp" inputmode="numeric" placeholder="123456" maxlength="12">
             <button id="confirmOtp" class="button secondary">Xác nhận</button>
           </div>
         </div>
-        <div id="authMessage" class="message"></div>
-
+        <div id="authMessage" class="message" role="status"></div>
         <div class="divider"></div>
         <div class="api-note">
           <strong>REST API</strong>
-          <span>Swagger: <a href="/docs" target="_blank">/docs</a></span>
-          <span>OpenAPI: <a href="/openapi.json" target="_blank">/openapi.json</a></span>
+          <span>Swagger: <a href="/docs" target="_blank" rel="noopener noreferrer">/docs</a></span>
+          <span>OpenAPI: <a href="/openapi.json" target="_blank" rel="noopener noreferrer">/openapi.json</a></span>
         </div>
-      </aside>
+      </div>
+    </dialog>
 
+    <section class="grid">
       <section class="panel create-panel">
         <div class="panel-head">
-          <div><span class="step">02</span><h2 id="workspaceTitle">Tạo video</h2></div>
+          <div><span class="step">01</span><h2 id="workspaceTitle">Tạo video</h2></div>
           <button id="refreshModel" class="ghost">Kiểm tra model</button>
         </div>
 
@@ -68,6 +81,8 @@
             </div>
             <button id="newChat" class="ghost">+ Chat mới</button>
           </div>
+          <label class="chat-history-label" for="chatAccount">Sử dụng tài khoản Muse</label>
+          <select id="chatAccount" class="chat-thread-select" aria-label="Chọn tài khoản Muse để chat"></select>
           <label class="chat-history-label" for="chatThreads">Cuộc hội thoại đã lưu trên trình duyệt</label>
           <select id="chatThreads" class="chat-thread-select" aria-label="Chọn cuộc hội thoại"></select>
 
@@ -117,8 +132,13 @@
               <label>Timeout (giây)</label>
               <input id="timeout" type="number" min="30" max="3600" value="600">
             </div>
+            <div>
+              <label for="taskCount">Số task / số tài khoản</label>
+              <input id="taskCount" type="number" min="1" max="20" value="1">
+            </div>
           </div>
 
+          <p id="poolHint" class="muted small">Batch sẽ chọn ngẫu nhiên các tài khoản đang rảnh trong pool.</p>
           <button id="generate" class="button primary big">
             <span>Tạo video</span><span class="arrow">→</span>
           </button>
@@ -129,7 +149,7 @@
 
     <section id="jobsPanel" class="panel jobs-panel">
       <div class="panel-head jobs-head">
-        <div><span class="step">03</span><h2>Generation jobs</h2></div>
+        <div><span class="step">02</span><h2>Generation jobs</h2></div>
         <button id="refreshJobs" class="ghost">Làm mới</button>
       </div>
       <div id="activeJob" class="active-job hidden"></div>
@@ -156,5 +176,6 @@
 
   <script src="/app.js"></script>
   <script src="/chat.js"></script>
+  <script src="/accounts.js"></script>
 </body>
 </html>
