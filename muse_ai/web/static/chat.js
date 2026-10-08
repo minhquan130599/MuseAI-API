@@ -65,12 +65,17 @@
     return threads.find((thread) => thread.id === activeId) || null;
   }
 
-  function createThread() {
+  function createThread(accountId = accountSelect.value) {
+    if (!accountId) {
+      chatNotice.textContent = "Hãy chọn tài khoản Muse trước khi tạo cuộc hội thoại.";
+      chatNotice.className = "message error";
+      return null;
+    }
     const thread = {
       id: makeId(),
       name: "Cuộc trò chuyện mới",
       sessionId: null,
-      accountId: accountSelect.value || null,
+      accountId,
       messages: [],
       updatedAt: Date.now()
     };
@@ -80,11 +85,19 @@
     persist();
     render();
     chatInput.focus();
+    return thread;
   }
 
   function render() {
+    const accountId = accountSelect.value;
+    const matching = accountId
+      ? threads.filter(thread => thread.accountId === accountId)
+      : [];
+    if (!matching.some(thread => thread.id === activeId)) {
+      activeId = matching[0]?.id || null;
+    }
     threadSelect.replaceChildren();
-    for (const thread of threads) {
+    for (const thread of matching) {
       const option = document.createElement("option");
       option.value = thread.id;
       option.textContent = thread.name || "Cuộc trò chuyện";
@@ -92,7 +105,6 @@
     }
     if (activeId) threadSelect.value = activeId;
     const thread = activeThread();
-    if (thread && thread.accountId) accountSelect.value = thread.accountId;
     sessionInfo.textContent = thread?.sessionId
       ? "Muse session: " + thread.sessionId
       : "Chưa có session · Lượt đầu sẽ tạo session mới";
@@ -231,8 +243,15 @@
   async function sendMessage() {
     const message = chatInput.value.trim();
     if (!message || busy) return;
-    if (!activeThread()) createThread();
+    if (!activeThread() || activeThread().accountId !== accountSelect.value) {
+      createThread(accountSelect.value);
+    }
     const thread = activeThread();
+    if (!thread || thread.accountId !== accountSelect.value) {
+      chatNotice.textContent = "Hãy chọn tài khoản Muse để gửi tin nhắn.";
+      chatNotice.className = "message error";
+      return;
+    }
     if (!thread.accountId && thread.sessionId) {
       chatNotice.textContent = "Hội thoại cũ không gắn tài khoản. Hãy tạo Chat mới và chọn tài khoản Muse.";
       chatNotice.className = "message error";
@@ -314,20 +333,27 @@
   buttons.forEach((button) => {
     button.addEventListener("click", () => setMode(button.dataset.mode));
   });
-  el("newChat").addEventListener("click", createThread);
+  el("newChat").addEventListener("click", () => createThread(accountSelect.value));
   threadSelect.addEventListener("change", () => {
     activeId = threadSelect.value;
     persist();
     render();
   });
   accountSelect.addEventListener("change", () => {
-    const thread = activeThread();
-    if (!thread || thread.messages.length || thread.sessionId) {
-      createThread();
-    } else {
-      thread.accountId = accountSelect.value || null;
+    const accountId = accountSelect.value;
+    if (!accountId) {
+      activeId = null;
       persist();
       render();
+      return;
+    }
+    const recent = threads.find(thread => thread.accountId === accountId);
+    if (recent) {
+      activeId = recent.id;
+      persist();
+      render();
+    } else {
+      createThread(accountId);
     }
   });
   window.addEventListener("muse-accounts-updated", (event) => {
@@ -346,15 +372,34 @@
         accountSelect.appendChild(option);
       }
     }
-    const thread = activeThread();
-    if (thread?.accountId) accountSelect.value = thread.accountId;
-    else if (previous) accountSelect.value = previous;
-    else if (accountSelect.options.length === 2) accountSelect.value = accountSelect.options[1].value;
-    if (thread && !thread.accountId && !thread.messages.length &&
-        !thread.sessionId && accountSelect.value) {
-      thread.accountId = accountSelect.value;
-      persist();
+    const readyIds = knownAccounts
+      .filter(account => account.enabled && account.status === "ready")
+      .map(account => account.id);
+    const lastThreadAccount = activeThread()?.accountId;
+    const selectedId = readyIds.includes(previous)
+      ? previous
+      : readyIds.includes(lastThreadAccount)
+        ? lastThreadAccount
+        : readyIds[0] || "";
+    accountSelect.value = selectedId;
+    if (!selectedId) {
+      activeId = null;
+      render();
+    } else {
+      const current = activeThread();
+      if (!current || current.accountId !== selectedId) {
+        const recent = threads.find(thread => thread.accountId === selectedId);
+        if (recent) {
+          activeId = recent.id;
+          render();
+        } else {
+          createThread(selectedId);
+        }
+      } else {
+        render();
+      }
     }
+    persist();
   });
   sendButton.addEventListener("click", sendMessage);
   chatInput.addEventListener("keydown", (event) => {
