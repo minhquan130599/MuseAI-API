@@ -8,6 +8,7 @@
   <link rel="stylesheet" href="/chat.css">
   <link rel="stylesheet" href="/auth-modal.css">
   <link rel="stylesheet" href="/accounts.css">
+  <link rel="stylesheet" href="/jobs-compact.css">
 </head>
 <body>
   <div class="noise"></div>
@@ -166,11 +167,20 @@
         </div>
         <span class="status"></span>
       </div>
-      <p class="job-prompt"></p>
+      <details class="job-prompt-details">
+        <summary class="job-prompt"></summary>
+        <p class="job-full-prompt"></p>
+      </details>
       <div class="job-message muted"></div>
       <div class="job-meta"></div>
-      <div class="videos"></div>
-      <div class="job-error"></div>
+      <details class="job-results hidden">
+        <summary class="job-results-summary"></summary>
+        <div class="videos"></div>
+      </details>
+      <details class="job-diagnostics hidden">
+        <summary>Chi tiết lỗi tải tệp</summary>
+        <pre class="job-error"></pre>
+      </details>
     </article>
   </template>
 
